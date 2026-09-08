@@ -1,0 +1,30 @@
+-- 001_initial — skema bazë (users, sessions, app_state, audit_log).
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'ROLE-ADMIN',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS app_state (
+  id TEXT PRIMARY KEY DEFAULT 'main',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  version INT NOT NULL DEFAULT 1,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+  id BIGSERIAL PRIMARY KEY,
+  at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  actor TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT ''
+);
