@@ -1,28 +1,11 @@
-# BioBes API — Web Service në Render (lidhet me Aiven Postgres).
-# KOPJOJE këtë file në RRËNJËN e repository-t GitHub (krahas folderit backend/)
-# dhe bëje deploy si Blueprint. Shih README-BACKEND.md.
+# BioBes ERP — Static Site on Render (single-file app, no build step)
 services:
   - type: web
-    name: biobes-api
-    runtime: node
-    plan: free
-    region: frankfurt
-    rootDir: backend
-    buildCommand: npm install --omit=dev
-    startCommand: node server.js
-    healthCheckPath: /api/health
-    envVars:
-      - key: NODE_VERSION
-        value: 20
-      - key: DATABASE_URL
-        sync: false # Service URI e Aiven — vendoset në dashboard
-      - key: ADMIN_USERNAME
-        value: admin
-      - key: ADMIN_PASSWORD
-        sync: false # vendoset në dashboard (Generate Value); MIN 8, rekomandohet 12+
-      - key: SESSION_TTL_HOURS
-        value: 24
-      - key: PGSSLMODE
-        value: require
-      - key: CORS_ORIGIN
-        value: "*"
+    name: biobes-erp
+    env: static
+    buildCommand: echo "static site - no build needed"
+    staticPublishPath: ./
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
