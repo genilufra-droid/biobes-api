@@ -45,7 +45,7 @@ async function loginUser(username, password) {
   const th = crypto.createHash('sha256').update(token).digest('hex');
   await p.query('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,NOW()+($3||\' hours\')::interval)',
     [th, u.id, String(SESSION_TTL_H)]);
-  return { token, user: { id: u.id, username: u.username, name: u.name, role: u.role } };
+  return { token, user: { id: u.id, username: u.username, name: u.name, role: u.role, rights: u.rights || null } };
 }
 
 async function userFromToken(token) {
