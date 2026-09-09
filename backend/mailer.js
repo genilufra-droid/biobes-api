@@ -37,14 +37,56 @@ function getTransport() {
   return cached;
 }
 
+function resendConfig() {
+  const key = (process.env.RESEND_API_KEY || '').trim();
+  if (!key) return null;
+  return {
+    key,
+    from: (process.env.SMTP_FROM || process.env.RESEND_FROM || '').trim() || 'BioBes ERP <onboarding@resend.dev>',
+  };
+}
+
+function isMailConfigured() {
+  return !!resendConfig() || isSmtpConfigured();
+}
+
+function resetMailText(username, code) {
+  return 'Përshëndetje ' + username + ',\n\nKodi yt 6-shifror për të vendosur fjalëkalim të ri në BioBes ERP është:\n\n    ' + code + '\n\nKodi skadon pas 15 minutash. Nëse nuk e kërkove ti, shpërfille këtë email.\n\n— BioBes ERP';
+}
+
+async function sendViaResend(cfg, to, username, code) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + cfg.key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: cfg.from,
+      to: [to],
+      subject: 'BioBes ERP — kodi i rivendosjes së fjalëkalimit',
+      text: resetMailText(username, code),
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  let j = {};
+  try { j = await r.json(); } catch (e) { j = {}; }
+  if (!r.ok) throw new Error('Resend ' + r.status + ': ' + ((j && j.message) || r.statusText || 'gabim'));
+  return j;
+}
+
 async function sendResetCode(to, username, code) {
+  const rc = resendConfig();
+  if (rc) {
+    console.log('[mailer] dërgohet via Resend te ' + to);
+    await sendViaResend(rc, to, username, code);
+    return;
+  }
   const c = smtpConfig();
+  console.log('[mailer] dërgohet via SMTP (' + c.host + ') te ' + to);
   await getTransport().sendMail({
     from: c.from,
     to,
     subject: 'BioBes ERP — kodi i rivendosjes së fjalëkalimit',
-    text: 'Përshëndetje ' + username + ',\n\nKodi yt 6-shifror për të vendosur fjalëkalim të ri në BioBes ERP është:\n\n    ' + code + '\n\nKodi skadon pas 15 minutash. Nëse nuk e kërkove ti, shpërfille këtë email.\n\n— BioBes ERP',
+    text: resetMailText(username, code),
   });
 }
 
-module.exports = { smtpConfig, isSmtpConfigured, sendResetCode };
+module.exports = { smtpConfig, isSmtpConfigured, resendConfig, isMailConfigured, sendResetCode };

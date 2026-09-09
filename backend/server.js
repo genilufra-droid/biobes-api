@@ -89,9 +89,9 @@ app.post('/api/auth/password', needDb, needAuth, async (req, res) => {
 
 app.post('/api/auth/forgot', rateLimit(5, 15 * 60 * 1000), needDb, async (req, res) => {
   try {
-    const { isSmtpConfigured, sendResetCode } = require('./mailer');
+    const { isMailConfigured, sendResetCode } = require('./mailer');
     const un = String((req.body || {}).username || '').trim();
-    if (!isSmtpConfigured()) return res.status(503).json({ ok: false, error: 'Shërbimi email nuk është konfiguruar — kontakto administratorin' });
+    if (!isMailConfigured()) return res.status(503).json({ ok: false, error: 'Shërbimi email nuk është konfiguruar — kontakto administratorin' });
     const p = getPool();
     const cur = await p.query('SELECT * FROM users WHERE username=$1', [un]);
     const u = cur.rows[0];
