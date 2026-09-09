@@ -151,22 +151,22 @@ app.get('/api/audit', needDb, needAuth, needAdminOnly, async (req, res) => {
 // Administrim përdoruesish (vetëm admin).
 app.get('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
-    const { rows } = await getPool().query('SELECT id,username,name,role,active,created_at FROM users ORDER BY created_at');
+    const { rows } = await getPool().query('SELECT id,username,name,role,active,rights,created_at FROM users ORDER BY created_at');
     res.json({ ok: true, users: rows });
   } catch (e) { console.error('[users:list]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 app.post('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
-    const { username, password, name, role } = req.body || {};
+    const { username, password, name, role, rights } = req.body || {};
     const un = String(username || '').trim();
     if (un.length < 3) return res.status(400).json({ ok: false, error: 'Përdoruesi min 3 karaktere' });
     if (!password || String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
     const r = String(role || 'ROLE-USER');
     const id = 'USR-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-    await getPool().query('INSERT INTO users(id,username,name,role,password_hash) VALUES($1,$2,$3,$4,$5)',
-      [id, un, String(name || ''), r, hashPassword(password)]);
+    await getPool().query('INSERT INTO users(id,username,name,role,password_hash,rights) VALUES($1,$2,$3,$4,$5,$6::jsonb)',
+      [id, un, String(name || ''), r, hashPassword(password), (rights && typeof rights === 'object') ? JSON.stringify(rights) : null]);
     await audit(req.user.username, 'USER_CREATE', un + ' / ' + r);
-    res.json({ ok: true, user: { id, username: un, name: String(name || ''), role: r, active: true } });
+    res.json({ ok: true, user: { id, username: un, name: String(name || ''), role: r, active: true, rights: (rights && typeof rights === 'object') ? rights : null } });
   } catch (e) {
     if (/duplicate|unique/i.test(String(e.message))) return res.status(409).json({ ok: false, error: 'Përdoruesi ekziston' });
     console.error('[users:create]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' });
@@ -178,7 +178,7 @@ app.patch('/api/admin/users/:id', needDb, needAuth, needAdminOnly, async (req, r
     const cur = await p.query('SELECT * FROM users WHERE id=$1', [req.params.id]);
     const u = cur.rows[0];
     if (!u) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
-    const { name, role, active, password } = req.body || {};
+    const { name, role, active, password, rights } = req.body || {};
     if (password !== undefined && String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
     if (active === false && u.role === 'ROLE-ADMIN') {
       const c = await p.query("SELECT COUNT(*)::int AS c FROM users WHERE role='ROLE-ADMIN' AND active=TRUE AND id<>$1", [u.id]);
@@ -190,10 +190,11 @@ app.patch('/api/admin/users/:id', needDb, needAuth, needAdminOnly, async (req, r
       active: active !== undefined ? !!active : u.active,
       hash: password !== undefined ? hashPassword(password) : u.password_hash,
     };
-    await p.query('UPDATE users SET name=$1,role=$2,active=$3,password_hash=$4 WHERE id=$5', [nu.name, nu.role, nu.active, nu.hash, u.id]);
+    const rightsJson = rights === null ? null : (rights !== undefined ? JSON.stringify(rights) : (u.rights ? JSON.stringify(u.rights) : null));
+    await p.query('UPDATE users SET name=$1,role=$2,active=$3,password_hash=$4,rights=$5::jsonb WHERE id=$6', [nu.name, nu.role, nu.active, nu.hash, rightsJson, u.id]);
     if (password !== undefined || active === false) await p.query('DELETE FROM sessions WHERE user_id=$1', [u.id]);
     await audit(req.user.username, 'USER_UPDATE', u.username);
-    res.json({ ok: true, user: { id: u.id, username: u.username, name: nu.name, role: nu.role, active: nu.active } });
+    res.json({ ok: true, user: { id: u.id, username: u.username, name: nu.name, role: nu.role, active: nu.active, rights: rights === null ? null : (rights !== undefined ? rights : (u.rights || null)) } });
   } catch (e) { console.error('[users:update]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
