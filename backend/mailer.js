@@ -31,6 +31,8 @@ function getTransport() {
   cached = nodemailer.createTransport({
     host: c.host, port: c.port, secure: c.secure,
     auth: { user: c.user, pass: c.pass },
+    connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000,
+    logger: true, debug: true,
   });
   return cached;
 }
