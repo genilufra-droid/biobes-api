@@ -9,13 +9,15 @@
     "import": "node import-backup.js",
     "export": "node export-backup.js",
     "test:live": "node test-live.js",
-    "demo:devices": "node demo-two-devices.js"
+    "demo:devices": "node demo-two-devices.js",
+    "test:concurrent": "node test-concurrent.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "express": "^4.19.2",
+    "nodemailer": "^6.10.1",
     "pg": "^8.12.0"
   }
 }

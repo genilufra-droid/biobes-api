@@ -66,6 +66,77 @@ app.post('/api/auth/logout', needAuth, async (req, res) => {
 
 app.get('/api/auth/me', needAuth, (req, res) => res.json({ ok: true, user: req.user }));
 
+app.get('/api/state/version', needDb, needAuth, async (req, res) => {
+  try {
+    const { rows } = await getPool().query("SELECT version,updated_at FROM app_state WHERE id='main'");
+    res.json({ ok: true, version: rows.length ? rows[0].version : 0, updatedAt: rows.length ? rows[0].updated_at : null });
+  } catch (e) { console.error('[state:version]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+app.post('/api/auth/password', needDb, needAuth, async (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (!password || String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
+    const p = getPool();
+    const me = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const meh = crypto.createHash('sha256').update(String(me)).digest('hex');
+    await p.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hashPassword(password), req.user.id]);
+    await p.query('DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2', [req.user.id, meh]);
+    await audit(req.user.username, 'PASSWORD_CHANGE', 'Fjalëkalimi u ndryshua');
+    res.json({ ok: true });
+  } catch (e) { console.error('[auth:password]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+app.post('/api/auth/forgot', rateLimit(5, 15 * 60 * 1000), needDb, async (req, res) => {
+  try {
+    const { isSmtpConfigured, sendResetCode } = require('./mailer');
+    const un = String((req.body || {}).username || '').trim();
+    if (!isSmtpConfigured()) return res.status(503).json({ ok: false, error: 'Shërbimi email nuk është konfiguruar — kontakto administratorin' });
+    const p = getPool();
+    const cur = await p.query('SELECT * FROM users WHERE username=$1', [un]);
+    const u = cur.rows[0];
+    if (u && u.active && (u.email || '').includes('@')) {
+      const code = String(crypto.randomInt(100000, 1000000));
+      const ch = crypto.createHash('sha256').update(u.id + ':' + code).digest('hex');
+      await p.query("INSERT INTO password_resets(username,code_hash,expires_at,attempts) VALUES($1,$2,NOW()+INTERVAL '15 minutes',0) ON CONFLICT(username) DO UPDATE SET code_hash=EXCLUDED.code_hash,expires_at=EXCLUDED.expires_at,attempts=0", [u.username, ch]);
+      try { await sendResetCode(u.email, u.username, code); }
+      catch (e) { console.error('[auth:forgot:mail]', e.message); return res.status(502).json({ ok: false, error: 'Emaili nuk u dërgua — provo përsëri ose kontakto administratorin' }); }
+      await audit(u.username, 'PASSWORD_FORGOT', 'Kodi u dërgua');
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error('[auth:forgot]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+app.post('/api/auth/reset', rateLimit(10, 15 * 60 * 1000), needDb, async (req, res) => {
+  try {
+    const { username, code, password } = req.body || {};
+    if (!password || String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
+    const un = String(username || '').trim();
+    const cd = String(code || '').trim();
+    if (!un || !/^\d{6}$/.test(cd)) return res.status(400).json({ ok: false, error: 'Kodi gabim' });
+    const p = getPool();
+    const cur = await p.query('SELECT * FROM users WHERE username=$1', [un]);
+    const u = cur.rows[0];
+    const rr = await p.query('SELECT * FROM password_resets WHERE username=$1', [un]);
+    const r = rr.rows[0];
+    let bad = 'Kodi gabim ose i skaduar';
+    if (u && u.active && r && r.expires_at && new Date(r.expires_at).getTime() > Date.now() && (r.attempts || 0) < 5) {
+      const ch = crypto.createHash('sha256').update(u.id + ':' + cd).digest('hex');
+      const a = Buffer.from(ch), b = Buffer.from(r.code_hash || '');
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+        await p.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hashPassword(password), u.id]);
+        await p.query('DELETE FROM password_resets WHERE username=$1', [un]);
+        await p.query('DELETE FROM sessions WHERE user_id=$1', [u.id]);
+        await audit(u.username, 'PASSWORD_RESET', 'U rivendos me email');
+        return res.json({ ok: true });
+      }
+      await p.query('UPDATE password_resets SET attempts=attempts+1 WHERE username=$1', [un]);
+      bad = 'Kodi gabim';
+    }
+    return res.status(400).json({ ok: false, error: bad });
+  } catch (e) { console.error('[auth:reset]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
 app.get('/api/state', needDb, needAuth, async (req, res) => {
   try {
     const { rows } = await getPool().query('SELECT data,version,updated_at FROM app_state WHERE id=\'main\'');
@@ -151,22 +222,24 @@ app.get('/api/audit', needDb, needAuth, needAdminOnly, async (req, res) => {
 // Administrim përdoruesish (vetëm admin).
 app.get('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
-    const { rows } = await getPool().query('SELECT id,username,name,role,active,rights,created_at FROM users ORDER BY created_at');
+    const { rows } = await getPool().query('SELECT id,username,name,role,active,email,rights,created_at FROM users ORDER BY created_at');
     res.json({ ok: true, users: rows });
   } catch (e) { console.error('[users:list]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 app.post('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
-    const { username, password, name, role, rights } = req.body || {};
+    const { username, password, name, role, rights, email } = req.body || {};
     const un = String(username || '').trim();
     if (un.length < 3) return res.status(400).json({ ok: false, error: 'Përdoruesi min 3 karaktere' });
     if (!password || String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
+    const em = String(email || '').trim();
+    if (em && !em.includes('@')) return res.status(400).json({ ok: false, error: 'Email i pavlefshëm' });
     const r = String(role || 'ROLE-USER');
     const id = 'USR-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-    await getPool().query('INSERT INTO users(id,username,name,role,password_hash,rights) VALUES($1,$2,$3,$4,$5,$6::jsonb)',
-      [id, un, String(name || ''), r, hashPassword(password), (rights && typeof rights === 'object') ? JSON.stringify(rights) : null]);
+    await getPool().query('INSERT INTO users(id,username,name,role,password_hash,rights,email) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)',
+      [id, un, String(name || ''), r, hashPassword(password), (rights && typeof rights === 'object') ? JSON.stringify(rights) : null, em]);
     await audit(req.user.username, 'USER_CREATE', un + ' / ' + r);
-    res.json({ ok: true, user: { id, username: un, name: String(name || ''), role: r, active: true, rights: (rights && typeof rights === 'object') ? rights : null } });
+    res.json({ ok: true, user: { id, username: un, name: String(name || ''), role: r, active: true, email: em, rights: (rights && typeof rights === 'object') ? rights : null } });
   } catch (e) {
     if (/duplicate|unique/i.test(String(e.message))) return res.status(409).json({ ok: false, error: 'Përdoruesi ekziston' });
     console.error('[users:create]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' });
@@ -178,8 +251,9 @@ app.patch('/api/admin/users/:id', needDb, needAuth, needAdminOnly, async (req, r
     const cur = await p.query('SELECT * FROM users WHERE id=$1', [req.params.id]);
     const u = cur.rows[0];
     if (!u) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
-    const { name, role, active, password, rights } = req.body || {};
+    const { name, role, active, password, rights, email } = req.body || {};
     if (password !== undefined && String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
+    if (email !== undefined && email && !String(email).includes('@')) return res.status(400).json({ ok: false, error: 'Email i pavlefshëm' });
     if (active === false && u.role === 'ROLE-ADMIN') {
       const c = await p.query("SELECT COUNT(*)::int AS c FROM users WHERE role='ROLE-ADMIN' AND active=TRUE AND id<>$1", [u.id]);
       if (c.rows[0].c === 0) return res.status(400).json({ ok: false, error: 'Nuk mund të çaktivizohet admini i fundit' });
@@ -191,10 +265,11 @@ app.patch('/api/admin/users/:id', needDb, needAuth, needAdminOnly, async (req, r
       hash: password !== undefined ? hashPassword(password) : u.password_hash,
     };
     const rightsJson = rights === null ? null : (rights !== undefined ? JSON.stringify(rights) : (u.rights ? JSON.stringify(u.rights) : null));
-    await p.query('UPDATE users SET name=$1,role=$2,active=$3,password_hash=$4,rights=$5::jsonb WHERE id=$6', [nu.name, nu.role, nu.active, nu.hash, rightsJson, u.id]);
+    const nem = email !== undefined ? String(email).trim() : (u.email || '');
+    await p.query('UPDATE users SET name=$1,role=$2,active=$3,password_hash=$4,rights=$5::jsonb,email=$6 WHERE id=$7', [nu.name, nu.role, nu.active, nu.hash, rightsJson, nem, u.id]);
     if (password !== undefined || active === false) await p.query('DELETE FROM sessions WHERE user_id=$1', [u.id]);
     await audit(req.user.username, 'USER_UPDATE', u.username);
-    res.json({ ok: true, user: { id: u.id, username: u.username, name: nu.name, role: nu.role, active: nu.active, rights: rights === null ? null : (rights !== undefined ? rights : (u.rights || null)) } });
+    res.json({ ok: true, user: { id: u.id, username: u.username, name: nu.name, role: nu.role, active: nu.active, email: nem, rights: rights === null ? null : (rights !== undefined ? rights : (u.rights || null)) } });
   } catch (e) { console.error('[users:update]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
