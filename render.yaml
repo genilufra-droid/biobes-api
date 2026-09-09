@@ -1,0 +1,36 @@
+# BioBes API — Web Service në Render (lidhet me Aiven Postgres).
+# KOPJOJE këtë file në RRËNJËN e repository-t GitHub (krahas folderit backend/)
+# dhe bëje deploy si Blueprint. Shih README-BACKEND.md.
+services:
+  - type: web
+    name: biobes-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false # Service URI e Aiven — vendoset në dashboard
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false # vendoset në dashboard (Generate Value); MIN 8, rekomandohet 12+
+      - key: SESSION_TTL_HOURS
+        value: 24
+      - key: PGSSLMODE
+        value: require
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: SMTP_HOST
+        sync: false # p.sh. smtp.gmail.com — bosh = rivendosja me email çaktivizohet
+      - key: SMTP_PORT
+        value: 587
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false # p.sh. BioBes ERP <noreply@firma.juaj>
