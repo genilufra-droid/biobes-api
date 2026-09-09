@@ -17,7 +17,7 @@ serveri, tërheq gjendjen në login dhe e dërgon automatikisht në çdo ruajtje
 | GET | `/api/audit` | regjistri i veprimeve | vetëm admin |
 | GET/POST | `/api/admin/users` | liston / krijon përdorues | vetëm admin |
 | PATCH | `/api/admin/users/:id` | emri, roli, aktiv, passwordi | vetëm admin |
-| POST | `/api/admin/wipe` | fshirja totale (`{password}` → `{ok:true}`) | password admini |
+| POST | `/api/admin/wipe` | fshirja totale (`{password}` → `{ok:true, wipedAt}`) + shenja e epokës | password admini |
 
 ## Teknologjitë + komandat e publikimit
 
@@ -76,6 +76,13 @@ ka ID duplikate, **lot/peshim me neto negative** ose pagesë me shumë ≤ 0.
 Gjendja ka **version**. `PUT` me `baseVersion` të vjetër kthen **409** — shkrimi
 i dytë nuk e mbishkruan të parin. Aplikacioni hap dritaren e konfliktit:
 "Merr nga serveri" / "Shkarko kopjen + Merr serverin" / "Mbaj të miat" (mbishkrim i qëllimshëm).
+
+## Epoka e fshirjes (Reset me 0 gjurmë kudo)
+
+`POST /api/admin/wipe` (tabela `meta`, migrimi `003`) lë shenjën `wiped_at`.
+`GET /api/state` e kthen (`wipedAt`); `PUT` pa `wipeAck` të saktë kthehet **409 `{wiped:true}`**
+— pajisjet e vjetra nuk ringjallin dot të dhëna të fshira. `PUT`-i i parë i miratuar
+(me `wipeAck`) e pastron shenjën dhe nis epokën e re. Përdoruesit + 1 rresht auditi `WIPE` mbijetojnë.
 
 ## Migrimet (pa humbur të dhëna)
 
