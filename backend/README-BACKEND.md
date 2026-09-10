@@ -14,10 +14,15 @@ serveri, tërheq gjendjen në login dhe e dërgon automatikisht në çdo ruajtje
 | GET | `/api/auth/me` | profili aktual | e autentikuar |
 | GET | `/api/state` | gjendja + versioni | e autentikuar |
 | PUT | `/api/state` | ruan gjendjen (kontroll + version) | e autentikuar |
-| GET | `/api/audit` | regjistri i veprimeve | vetëm admin |
+| GET | `/api/audit` | regjistri i veprimeve | e drejta `audit:read` (admin/roli përkatës) |
 | GET/POST | `/api/admin/users` | liston / krijon përdorues | vetëm admin |
-| PATCH | `/api/admin/users/:id` | emri, roli, aktiv, passwordi | vetëm admin |
+| PATCH | `/api/admin/users/:id` | emri, roli, aktiv, passwordi, grupet | vetëm admin |
 | POST | `/api/admin/wipe` | fshirja totale (`{password}` → `{ok:true, wipedAt}`) + shenja e epokës | password admini |
+| GET | `/api/access/modules` | modulet (aplikacionet) | e autentikuar |
+| GET | `/api/access/groups` | grupet e qasjes (p.sh. "Shitjet / Menaxher") | e autentikuar |
+| GET | `/api/access/users/:id/groups` | grupet + modulet e një përdoruesi | admin ose vetja |
+| PATCH | `/api/access/users/:id/groups` | vendos grupet e një përdoruesi (formulari i qasjes) | vetëm admin |
+| GET | `/api/access/modules/:id/groups` | grupet e një moduli | vetëm admin |
 
 ## Teknologjitë + komandat e publikimit
 
@@ -55,15 +60,53 @@ serveri, tërheq gjendjen në login dhe e dërgon automatikisht në çdo ruajtje
 ## Rolet dhe përdoruesit
 
 - `ROLE-ADMIN` — gjithçka, përfshirë `/api/audit`, menaxhimin e përdoruesve dhe wipe.
-- Çdo rol tjetër (p.sh. `ROLE-USER`) — lexim/shkrim i gjendjes, pa administrim.
-- Shembull krijimi (si admin):
+- Çdo rol tjetër (p.sh. `ROLE-USER`) — qasja sipas **moduleve/grupeve** (shih më poshtë).
+- Shembull krijimi (si admin) me grupe:
   ```bash
   curl -X POST $API/api/admin/users -H "Authorization: Bearer $TOK" \
     -H 'Content-Type: application/json' \
-    -d '{"username":"punetor","password":"...8+...","name":"Emer","role":"ROLE-USER"}'
+    -d '{"username":"shitës","password":"...8+...","name":"Emër","role":"ROLE-USER","groups":["GRP-SAL-USER"]}'
   ```
 - Admini i fundit aktiv nuk mund të çaktivizohet (mbrojtje nga lockout-i).
 - Ndryshimi i passwordit / çaktivizimi i heq sesionet aktive përdoruesit.
+
+## Qasja sipas moduleve — skema Odoo
+
+Zbatuar në `migrations/006_odoo_access.sql` + `access.js`, me të njëjtat koncepte si Odoo:
+
+| Koncepti Odoo | Këtu | Tabela |
+|---|---|---|
+| Aplikacionet (`ir.module.category`) | Modulet: Inventari, Shitjet, Blerjet, Financa, Administrimi | `access_modules` |
+| Grupet (`res.groups`, me `implied_ids`) | Grupe "Përdorues"/"Menaxher" për çdo modul | `access_groups` |
+| Të drejtat e modeleve (`ir.model.access`) | CRUD për `app_state`, `audit`, `users`, `access` | `access_rights` |
+| Rregullat e regjistrimeve (`ir.rule`, `domain_force`) | Filtra JSON për regjistrime | `access_rules` |
+| `res.users ↔ res.groups` | Anëtarësia përdorues-grup | `user_groups` |
+
+**Si funksionon:**
+- `ROLE-ADMIN` = superuser (si `uid=1` në Odoo): sheh dhe shkruan të gjitha modulet.
+- Çdo përdorues tjetër sheh **vetëm modulet** që i janë dhënë përmes grupeve të tij
+  (përfshirë grupet e nënkuptuara: p.sh. `GRP-SAL-MGR` nënkupton `GRP-SAL-USER`).
+- `GET /api/state` kthen vetëm fushat e moduleve të tij; `PUT /api/state` **bashkon**
+  shkrimin e tij me gjendjen ekzistuese — nuk i fshin/mbishkruan modulet e të tjerëve.
+- Login dhe `/api/auth/me` kthejnë `modules` (modulet + fushat e lejuara) për formularët.
+- `/api/audit` kontrollohet me `access_rights` (modeli `audit`), jo vetëm me rol.
+
+**Grupet e paracaktuara (seed):**
+
+| Modul | Grupet |
+|---|---|
+| Inventari (`MOD-INV`) | `GRP-INV-USER`, `GRP-INV-MGR` |
+| Shitjet (`MOD-SAL`) | `GRP-SAL-USER`, `GRP-SAL-MGR` |
+| Blerjet (`MOD-PUR`) | `GRP-PUR-USER`, `GRP-PUR-MGR` |
+| Financa (`MOD-FIN`) | `GRP-FIN-USER`, `GRP-FIN-MGR` |
+| Administrimi (`MOD-SET`) | `GRP-SET-USER`, `GRP-SET-ADMIN` |
+
+**Formularët e qasjes (si të japësh/ndryshosh module te një përdorues):**
+1. Listo grupet: `GET /api/access/groups` (dhe modulet: `GET /api/access/modules`).
+2. Në krijim: `POST /api/admin/users` me `{"groups":["GRP-SAL-USER","GRP-INV-MGR"], ...}`.
+3. Më vonë: `PATCH /api/access/users/:id/groups` me `{"groups":[...]}` — zëvendëson
+   anëtarësinë (si skeda "Qasja" e përdoruesit në Odoo).
+4. Verifiko: `GET /api/access/users/:id/groups` kthen grupet + modulet efektive.
 
 ## Kontrollet e serverit (guardrails)
 
@@ -138,6 +181,8 @@ curl localhost:3000/api/health
 
 `migrations/001_initial.sql`: `users`, `sessions` (hash sha256 + skadim),
 `app_state` (rreshti `main`: JSONB + version), `audit_log` (+ `schema_migrations` nga runner-i).
+`migrations/006_odoo_access.sql`: `access_modules`, `access_groups`, `access_rights`,
+`access_rules`, `user_groups` (skema Odoo e qasjes sipas moduleve, me seed).
 
 ## Hapa pas-live (opsional)
 

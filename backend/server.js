@@ -4,7 +4,8 @@ const crypto = require('crypto');
 const { getPool, dbOk } = require('./db');
 const { migrate } = require('./migrate');
 const { validateState } = require('./validateState');
-const { ensureAdmin, loginUser, userFromToken, logoutToken, rateLimit, verifyPassword, hashPassword } = require('./auth');
+const { ensureAdmin, loginUser, userFromToken, logoutToken, rateLimit, verifyPassword, hashPassword, groupsForUser } = require('./auth');
+const access = require('./access');
 
 const app = express();
 app.set('trust proxy', 1); // Render: IP reale e klientit për rate-limit
@@ -31,12 +32,36 @@ async function needAuth(req, res, next) {
   const user = await userFromToken(tok).catch(() => null);
   if (!user) return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
   req.user = user;
+  // Konteksti i qasjes (modulet + superuser) sipas skemës Odoo.
+  try {
+    req.access = await access.loadAccessContext(user);
+  } catch (e) {
+    console.error('[access] loadAccessContext:', e.message);
+    // Dështim i sigurt (deny): jomodul për user jo-superuser, bypass për admin.
+    const su = access.isSuperuser(user);
+    req.access = { user, superuser: su, modules: su ? null : { full: false, allowedModules: [], allowedFields: [] }, allowedModules: [] };
+  }
   next();
 }
 
 function needAdminOnly(req, res, next) {
   if (!req.user || req.user.role !== 'ROLE-ADMIN') return res.status(403).json({ ok: false, error: 'Kërkohet rol administratori' });
   next();
+}
+
+// Middleware Odoo: kërkon të drejtën `action` mbi `model` (ir.model.access).
+function needAccess(model, action) {
+  return async (req, res, next) => {
+    try {
+      if (!req.user) return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
+      if (access.isSuperuser(req.user)) return next();
+      const a = await access.modelAccess(req.user.id, model);
+      if (!access.checkAccess(a, action)) {
+        return res.status(403).json({ ok: false, error: 'Nuk keni të drejtë për këtë veprim (' + model + ':' + action + ')' });
+      }
+      next();
+    } catch (e) { console.error('[access] needAccess:', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+  };
 }
 
 async function audit(actor, action, detail) {
@@ -56,7 +81,7 @@ app.post('/api/auth/login', rateLimit(10, 15 * 60 * 1000), needDb, async (req, r
   catch (e) { console.error('[login]', e.message); return res.status(503).json({ ok: false, error: 'Databaza nuk përgjigjet' }); }
   if (!r) return res.status(401).json({ ok: false, error: 'Kredenciale të gabuara' });
   await audit(r.user.username, 'LOGIN', 'Hyrje në API');
-  res.json({ ok: true, token: r.token, user: r.user });
+  res.json({ ok: true, token: r.token, user: r.user, modules: r.modules });
 });
 
 app.post('/api/auth/logout', needAuth, async (req, res) => {
@@ -64,7 +89,12 @@ app.post('/api/auth/logout', needAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/auth/me', needAuth, (req, res) => res.json({ ok: true, user: req.user }));
+app.get('/api/auth/me', needDb, needAuth, async (req, res) => {
+  try {
+    const groups = await groupsForUser(req.user.id);
+    res.json({ ok: true, user: req.user, groups, modules: req.access.modules, superuser: req.access.superuser });
+  } catch (e) { console.error('[auth:me]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
 
 app.get('/api/state/version', needDb, needAuth, async (req, res) => {
   try {
@@ -142,8 +172,10 @@ app.get('/api/state', needDb, needAuth, async (req, res) => {
     const { rows } = await getPool().query('SELECT data,version,updated_at FROM app_state WHERE id=\'main\'');
     const wm = await getPool().query("SELECT value FROM meta WHERE key='wiped_at'");
     const wipedAt = wm.rows.length ? wm.rows[0].value : null;
-    if (!rows.length) return res.json({ ok: true, state: null, version: 0, updatedAt: null, wipedAt });
-    res.json({ ok: true, state: rows[0].data, version: rows[0].version, updatedAt: rows[0].updated_at, wipedAt });
+    if (!rows.length) return res.json({ ok: true, state: null, version: 0, updatedAt: null, wipedAt, modules: req.access.modules });
+    // Qasja sipas moduleve (Odoo): superuser/Administrator sheh gjithçka; të tjerët vetëm modulet e tyre.
+    const state = access.applyStateModules(rows[0].data, req.access.modules);
+    res.json({ ok: true, state, version: rows[0].version, updatedAt: rows[0].updated_at, wipedAt, modules: req.access.modules });
   } catch (e) { console.error('[state:get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
@@ -153,11 +185,31 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
     if (!state || typeof state !== 'object' || Array.isArray(state)) {
       return res.status(400).json({ ok: false, error: 'State i pavlefshëm' });
     }
-    const vstate = validateState(state);
-    if (!vstate.ok) return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vstate.errors[0], errors: vstate.errors });
-    const raw = JSON.stringify(state);
-    if (raw.length > MAX_STATE_BYTES) return res.status(413).json({ ok: false, error: 'State tejkalon 25 MB' });
     const p = getPool();
+
+    // Qasja sipas moduleve (Odoo): një user jo-superuser shkruan vetëm modulet
+    // që i takojnë; fushat e tjera mbahen siç janë në server (nuk i fshin të tjerët).
+    let stateToStore = state;
+    if (req.access && req.access.superuser === false) {
+      const scoped = access.applyStateModules(state, req.access.modules);
+      const onlyFields = (req.access.modules && req.access.modules.allowedFields) || [];
+      const vscoped = validateState(scoped, { onlyFields });
+      if (!vscoped.ok) return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vscoped.errors[0], errors: vscoped.errors });
+      // Merge me gjendjen aktuale: ruaj fushat e tjera siç janë.
+      const cur = await p.query("SELECT data FROM app_state WHERE id='main'");
+      const base = (cur.rows.length && cur.rows[0].data && typeof cur.rows[0].data === 'object' && !Array.isArray(cur.rows[0].data))
+        ? cur.rows[0].data : {};
+      stateToStore = Object.assign({}, base, scoped);
+      const vfull = validateState(stateToStore);
+      if (!vfull.ok) return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vfull.errors[0], errors: vfull.errors });
+    } else {
+      const vstate = validateState(state);
+      if (!vstate.ok) return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vstate.errors[0], errors: vstate.errors });
+    }
+
+    const raw = JSON.stringify(stateToStore);
+    if (raw.length > MAX_STATE_BYTES) return res.status(413).json({ ok: false, error: 'State tejkalon 25 MB' });
+
     const wrow = await p.query("SELECT value FROM meta WHERE key='wiped_at'");
     const wipedMark = wrow.rows.length ? wrow.rows[0].value : null;
     const clearWipeMark = async () => { try { await p.query("DELETE FROM meta WHERE key='wiped_at'"); } catch (e) {} };
@@ -172,7 +224,7 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
         [raw]
       );
       const ver = r.rows[0].version;
-      await audit(req.user.username, 'STATE_PUT', 'version ' + ver + ' (blind)');
+      await audit(req.user.username, 'STATE_PUT', 'version ' + ver + ' (blind)' + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')));
       await clearWipeMark();
       return res.json({ ok: true, version: ver, updatedAt: new Date().toISOString() });
     }
@@ -205,13 +257,13 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
       return res.status(409).json({ ok: false, error: 'Konflikt versionesh — ringarko state-in', version: ver });
     }
     const ver = r.rows[0].version;
-    await audit(req.user.username, 'STATE_PUT', 'version ' + ver);
+    await audit(req.user.username, 'STATE_PUT', 'version ' + ver + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')));
     await clearWipeMark();
     res.json({ ok: true, version: ver, updatedAt: new Date().toISOString() });
   } catch (e) { console.error('[state:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.get('/api/audit', needDb, needAuth, needAdminOnly, async (req, res) => {
+app.get('/api/audit', needDb, needAuth, needAccess('audit', 'read'), async (req, res) => {
   try {
     const lim = Math.min(Math.max(+req.query.limit || 100, 1), 500);
     const { rows } = await getPool().query('SELECT id,at,actor,action,detail FROM audit_log ORDER BY id DESC LIMIT $1', [lim]);
@@ -222,8 +274,15 @@ app.get('/api/audit', needDb, needAuth, needAdminOnly, async (req, res) => {
 // Administrim përdoruesish (vetëm admin).
 app.get('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
-    const { rows } = await getPool().query('SELECT id,username,name,role,active,email,rights,created_at FROM users ORDER BY created_at');
-    res.json({ ok: true, users: rows });
+    const p = getPool();
+    const { rows } = await p.query('SELECT id,username,name,role,active,email,rights,created_at FROM users ORDER BY created_at');
+    const ug = await p.query(
+      `SELECT ug.user_id, g.id, g.name, g.full_name, g.module_id
+       FROM user_groups ug JOIN access_groups g ON g.id = ug.group_id ORDER BY g.full_name`);
+    const byUser = {};
+    for (const r of ug.rows) (byUser[r.user_id] = byUser[r.user_id] || []).push({ id: r.id, name: r.name, full_name: r.full_name, module_id: r.module_id });
+    const users = rows.map((u) => ({ ...u, groups: byUser[u.id] || [] }));
+    res.json({ ok: true, users });
   } catch (e) { console.error('[users:list]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 app.post('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) => {
@@ -236,10 +295,18 @@ app.post('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) =
     if (em && !em.includes('@')) return res.status(400).json({ ok: false, error: 'Email i pavlefshëm' });
     const r = String(role || 'ROLE-USER');
     const id = 'USR-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-    await getPool().query('INSERT INTO users(id,username,name,role,password_hash,rights,email) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)',
+    const p = getPool();
+    await p.query('INSERT INTO users(id,username,name,role,password_hash,rights,email) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)',
       [id, un, String(name || ''), r, hashPassword(password), (rights && typeof rights === 'object') ? JSON.stringify(rights) : null, em]);
-    await audit(req.user.username, 'USER_CREATE', un + ' / ' + r);
-    res.json({ ok: true, user: { id, username: un, name: String(name || ''), role: r, active: true, email: em, rights: (rights && typeof rights === 'object') ? rights : null } });
+    // Grupet (Odoo): një listë ID-sh grupesh, p.sh. ["GRP-SAL-USER","GRP-INV-MGR"].
+    const groupIds = Array.isArray(req.body.groups) ? req.body.groups.map((g) => String(g)) : [];
+    if (r === 'ROLE-ADMIN' && !groupIds.includes('GRP-SET-ADMIN')) groupIds.push('GRP-SET-ADMIN');
+    for (const gid of groupIds) {
+      await p.query('INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [id, gid]);
+    }
+    const groups = await groupsForUser(id);
+    await audit(req.user.username, 'USER_CREATE', un + ' / ' + r + (groupIds.length ? ' / grupe=' + groupIds.join(',') : ''));
+    res.json({ ok: true, user: { id, username: un, name: String(name || ''), role: r, active: true, email: em, rights: (rights && typeof rights === 'object') ? rights : null, groups } });
   } catch (e) {
     if (/duplicate|unique/i.test(String(e.message))) return res.status(409).json({ ok: false, error: 'Përdoruesi ekziston' });
     console.error('[users:create]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' });
@@ -267,9 +334,19 @@ app.patch('/api/admin/users/:id', needDb, needAuth, needAdminOnly, async (req, r
     const rightsJson = rights === null ? null : (rights !== undefined ? JSON.stringify(rights) : (u.rights ? JSON.stringify(u.rights) : null));
     const nem = email !== undefined ? String(email).trim() : (u.email || '');
     await p.query('UPDATE users SET name=$1,role=$2,active=$3,password_hash=$4,rights=$5::jsonb,email=$6 WHERE id=$7', [nu.name, nu.role, nu.active, nu.hash, rightsJson, nem, u.id]);
+    // Grupet (Odoo): nëse dërgohet `groups`, zëvendëson tërësisht anëtarësinë.
+    if (Array.isArray(req.body.groups)) {
+      let groupIds = req.body.groups.map((g) => String(g));
+      if (nu.role === 'ROLE-ADMIN' && !groupIds.includes('GRP-SET-ADMIN')) groupIds.push('GRP-SET-ADMIN');
+      await p.query('DELETE FROM user_groups WHERE user_id=$1', [u.id]);
+      for (const gid of groupIds) {
+        await p.query('INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [u.id, gid]);
+      }
+    }
     if (password !== undefined || active === false) await p.query('DELETE FROM sessions WHERE user_id=$1', [u.id]);
+    const groups = await groupsForUser(u.id);
     await audit(req.user.username, 'USER_UPDATE', u.username);
-    res.json({ ok: true, user: { id: u.id, username: u.username, name: nu.name, role: nu.role, active: nu.active, email: nem, rights: rights === null ? null : (rights !== undefined ? rights : (u.rights || null)) } });
+    res.json({ ok: true, user: { id: u.id, username: u.username, name: nu.name, role: nu.role, active: nu.active, email: nem, rights: rights === null ? null : (rights !== undefined ? rights : (u.rights || null)), groups } });
   } catch (e) { console.error('[users:update]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
@@ -289,6 +366,67 @@ app.delete('/api/admin/users/:id', needDb, needAuth, needAdminOnly, async (req, 
     await audit(req.user.username, 'USER_DELETE', u.username);
     res.json({ ok: true, deleted: u.username });
   } catch (e) { console.error('[users:delete]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+// ===== Qasja sipas moduleve (Odoo): modulet, grupet dhe anëtarësia ============
+// Modulet (aplikacionet) — të dukshme për çdo user të autentikuar (për formularët),
+// të administrueshme vetëm nga admini.
+app.get('/api/access/modules', needDb, needAuth, async (req, res) => {
+  try {
+    const { rows } = await getPool().query('SELECT * FROM access_modules ORDER BY sequence, name');
+    res.json({ ok: true, modules: rows });
+  } catch (e) { console.error('[access:modules]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+app.get('/api/access/groups', needDb, needAuth, async (req, res) => {
+  try {
+    const { rows } = await getPool().query('SELECT * FROM access_groups ORDER BY module_id, full_name');
+    res.json({ ok: true, groups: rows });
+  } catch (e) { console.error('[access:groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+// Grupet e një përdoruesi (me implikimet e zgjeruara) — admin ose vetja.
+app.get('/api/access/users/:id/groups', needDb, needAuth, async (req, res) => {
+  try {
+    if (req.params.id !== req.user.id && !access.isSuperuser(req.user)) {
+      return res.status(403).json({ ok: false, error: 'Nuk keni të drejtë për këtë veprim' });
+    }
+    const p = getPool();
+    const cur = await p.query('SELECT id FROM users WHERE id=$1', [req.params.id]);
+    if (!cur.rows.length) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
+    const groups = await groupsForUser(req.params.id);
+    const modules = await access.stateModules(req.params.id, p);
+    res.json({ ok: true, groups, modules });
+  } catch (e) { console.error('[access:user-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+// Grupet e një moduli (për formularin e modulit) — vetëm admin.
+app.get('/api/access/modules/:id/groups', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const { rows } = await getPool().query('SELECT * FROM access_groups WHERE module_id=$1 ORDER BY full_name', [req.params.id]);
+    res.json({ ok: true, groups: rows });
+  } catch (e) { console.error('[access:module-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+// Përditësim i grupeve të një përdoruesi (formulari "Qasja" te përdoruesi) — vetëm admin.
+app.patch('/api/access/users/:id/groups', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const p = getPool();
+    const cur = await p.query('SELECT id, username, role FROM users WHERE id=$1', [req.params.id]);
+    const u = cur.rows[0];
+    if (!u) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
+    if (!Array.isArray(req.body.groups)) return res.status(400).json({ ok: false, error: 'Kërkohet lista `groups`' });
+    let groupIds = req.body.groups.map((g) => String(g));
+    if (u.role === 'ROLE-ADMIN' && !groupIds.includes('GRP-SET-ADMIN')) groupIds.push('GRP-SET-ADMIN');
+    await p.query('DELETE FROM user_groups WHERE user_id=$1', [u.id]);
+    for (const gid of groupIds) {
+      await p.query('INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [u.id, gid]);
+    }
+    const groups = await groupsForUser(u.id);
+    const modules = await access.stateModules(u.id, p);
+    await audit(req.user.username, 'ACCESS_UPDATE', u.username + ' / grupe=' + groupIds.join(','));
+    res.json({ ok: true, user: u, groups, modules });
+  } catch (e) { console.error('[access:user-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
 // Kontrata që pret frontend-i: POST /api/admin/wipe {password} → {ok:true}
