@@ -19,6 +19,7 @@ let pass=0,fail=0; const ok=(n,c,e='')=>{c?pass++:fail++;console.log((c?'PASS ':
   const init=await call('/api/state',{method:'PUT',headers:H,body:JSON.stringify({state:s0,baseVersion:0})}); ok('initial-state-v1',init.ok&&init.data.version===1);
   const wipe=await call('/api/admin/wipe',{method:'POST',body:JSON.stringify({password:PASS})}); const epoch=wipe.data.wipedAt; ok('wipe-created-epoch',wipe.ok&&!!epoch,JSON.stringify(wipe.data));
   const afterWipe=await call('/api/state',{headers:H}); ok('state-empty-after-wipe',afterWipe.ok&&afterWipe.data.version===0&&afterWipe.data.state===null); ok('get-exposes-epoch',afterWipe.data.wipedAt===epoch);
+  const versionAfterWipe=await call('/api/state/version',{headers:H}); ok('version-endpoint-exposes-epoch',versionAfterWipe.ok&&versionAfterWipe.data.version===0&&versionAfterWipe.data.wipedAt===epoch,JSON.stringify(versionAfterWipe.data));
   const staleNoAck=await call('/api/state',{method:'PUT',headers:H,body:JSON.stringify({state:s0,baseVersion:1})}); ok('stale-device-no-ack-blocked',staleNoAck.status===409&&staleNoAck.data.wiped===true);
   const fresh={...s0,customers:[{id:'NEW',code:'NEW',name:'New',balance:0}]};
   const freshPut=await call('/api/state',{method:'PUT',headers:H,body:JSON.stringify({state:fresh,baseVersion:0,wipeAck:epoch})}); ok('fresh-device-ack-init',freshPut.ok&&freshPut.data.version===1,JSON.stringify(freshPut.data));
@@ -26,6 +27,7 @@ let pass=0,fail=0; const ok=(n,c,e='')=>{c?pass++:fail++;console.log((c?'PASS ':
   const next={...fresh,suppliers:[{id:'S1',code:'S1',name:'Supplier',balance:0}]};
   const second=await call('/api/state',{method:'PUT',headers:H,body:JSON.stringify({state:next,baseVersion:1,wipeAck:epoch})}); ok('same-ack-next-write-ok',second.ok&&second.data.version===2,JSON.stringify(second.data));
   const afterSecond=await call('/api/state',{headers:H}); ok('epoch-persists-after-later-write',afterSecond.data.wipedAt===epoch);
+  const versionLater=await call('/api/state/version',{headers:H}); ok('version-endpoint-keeps-epoch',versionLater.ok&&versionLater.data.version===2&&versionLater.data.wipedAt===epoch,JSON.stringify(versionLater.data));
   const resurrect={...s0,customers:[{id:'RESURRECT',code:'R',name:'Stale resurrect',balance:0}]};
   const staleCurrentVersion=await call('/api/state',{method:'PUT',headers:H,body:JSON.stringify({state:resurrect,baseVersion:2})}); ok('stale-device-current-version-still-blocked',staleCurrentVersion.status===409&&staleCurrentVersion.data.wiped===true,'HTTP '+staleCurrentVersion.status);
   const final=await call('/api/state',{headers:H}); ok('stale-data-never-resurrected',final.ok&&!(final.data.state.customers||[]).some(x=>x.id==='RESURRECT'));
