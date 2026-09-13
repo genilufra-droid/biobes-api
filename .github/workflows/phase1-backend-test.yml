@@ -1,0 +1,29 @@
+name: Phase 1 backend verification
+
+on:
+  push:
+    branches:
+      - chatgpt/faza1-cloud-sync
+    paths:
+      - .github/workflows/phase1-backend-test.yml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/faza1-cloud-sync
+      - name: Install dependencies
+        run: npm ci
+      - name: Syntax
+        run: node --check server.js
+      - name: Access tests
+        run: npm run test:access
+      - name: E2E tests
+        run: npm run test:e2e
+      - name: Concurrent tests
+        run: npm run test:concurrent
