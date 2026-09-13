@@ -216,20 +216,18 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
     if (wipedMark && wipeAck !== wipedMark) {
       return res.status(409).json({ ok: false, error: 'Serveri u pastrua totalisht — pajisja duhet të pastrohet ose të rifillojë epokën', wiped: true, wipedAt: wipedMark });
     }
+    // Phase 1 cloud safety: every normal state write is optimistic-concurrency guarded.
+    // A missing baseVersion is never allowed to overwrite the current server state.
     if (baseVersion === undefined || baseVersion === null) {
-      // Blind write (first push / legacy client): single-statement atomic increment.
-      const r = await p.query(
-        `INSERT INTO app_state(id,data,version,updated_at) VALUES('main',$1::jsonb,1,NOW())
-         ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,version=app_state.version+1,updated_at=NOW() RETURNING version`,
-        [raw]
-      );
-      const ver = r.rows[0].version;
-      await audit(req.user.username, 'STATE_PUT', 'version ' + ver + ' (blind)' + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')));
-      await clearWipeMark();
-      return res.json({ ok: true, version: ver, updatedAt: new Date().toISOString() });
+      await audit(req.user.username, 'STATE_PUT_REJECTED', 'missing baseVersion');
+      return res.status(400).json({
+        ok: false,
+        code: 'BASE_VERSION_REQUIRED',
+        error: 'baseVersion është i detyrueshëm — merrni fillimisht /api/state'
+      });
     }
-    if (!Number.isFinite(+baseVersion)) {
-      return res.status(400).json({ ok: false, error: 'baseVersion i pavlefshëm' });
+    if (!Number.isInteger(Number(baseVersion)) || Number(baseVersion) < 0) {
+      return res.status(400).json({ ok: false, code: 'BASE_VERSION_INVALID', error: 'baseVersion i pavlefshëm' });
     }
     // Atomic compare-and-swap: check + write in ONE statement, no lost-update race.
     const r = await p.query(
