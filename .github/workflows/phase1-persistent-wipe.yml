@@ -1,0 +1,42 @@
+name: Phase 1 persistent wipe epoch
+on:
+  push:
+    branches: [chatgpt/faza1-cloud-sync]
+    paths:
+      - .github/workflows/phase1-persistent-wipe.yml
+      - .github/phase1-persistent-wipe.py
+permissions:
+  contents: write
+jobs:
+  patch-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/faza1-cloud-sync
+      - name: Apply persistent wipe patch
+        working-directory: .
+        run: python3 .github/phase1-persistent-wipe.py
+      - name: Install dependencies
+        run: npm install
+      - name: Syntax
+        run: node --check server.js && node --check test-wipe-epoch.js
+      - name: Access tests
+        run: npm run test:access
+      - name: E2E tests
+        run: npm run test:e2e
+      - name: CAS concurrency
+        run: npm run test:concurrent
+      - name: Persistent wipe regression
+        run: node test-wipe-epoch.js
+      - name: Commit backend fix
+        working-directory: .
+        run: |
+          git config user.name 'ChatGPT Phase 1'
+          git config user.email 'actions@users.noreply.github.com'
+          git add backend/server.js
+          git commit -m 'fix(cloud): keep wipe epoch persistent across writes'
+          git push origin HEAD:chatgpt/faza1-cloud-sync
