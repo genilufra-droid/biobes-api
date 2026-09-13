@@ -1,0 +1,21 @@
+name: Phase 1 dependency audit
+on:
+  push:
+    branches: [chatgpt/faza1-cloud-sync]
+    paths: [.github/workflows/phase1-dependency-audit.yml]
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/faza1-cloud-sync
+      - name: Install dependencies
+        run: npm install
+      - name: Audit production dependencies
+        run: npm audit --omit=dev || true
+      - name: Audit all dependencies
+        run: npm audit || true
