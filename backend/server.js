@@ -212,7 +212,6 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
 
     const wrow = await p.query("SELECT value FROM meta WHERE key='wiped_at'");
     const wipedMark = wrow.rows.length ? wrow.rows[0].value : null;
-    const clearWipeMark = async () => { try { await p.query("DELETE FROM meta WHERE key='wiped_at'"); } catch (e) {} };
     if (wipedMark && wipeAck !== wipedMark) {
       return res.status(409).json({ ok: false, error: 'Serveri u pastrua totalisht — pajisja duhet të pastrohet ose të rifillojë epokën', wiped: true, wipedAt: wipedMark });
     }
@@ -246,7 +245,6 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
         );
         if (ins.rows.length) {
           await audit(req.user.username, 'STATE_PUT', 'version 1 (init)');
-          await clearWipeMark();
           return res.json({ ok: true, version: 1, updatedAt: new Date().toISOString() });
         }
       }
@@ -256,7 +254,6 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
     }
     const ver = r.rows[0].version;
     await audit(req.user.username, 'STATE_PUT', 'version ' + ver + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')));
-    await clearWipeMark();
     res.json({ ok: true, version: ver, updatedAt: new Date().toISOString() });
   } catch (e) { console.error('[state:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
