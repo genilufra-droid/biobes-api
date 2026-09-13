@@ -18,7 +18,7 @@ jobs:
         with:
           ref: chatgpt/faza1-cloud-sync
       - name: Install dependencies
-        run: npm ci
+        run: npm install --no-audit --no-fund
       - name: Syntax
         run: node --check server.js
       - name: Access tests
