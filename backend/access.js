@@ -7,13 +7,32 @@ const { getPool } = require('./db');
 // Është e njëjta ndarje që përdor `validateState` (KNOWN) e frontend-i.
 const MODEL_MODULES = {
   app_state: {
-    'MOD-INV': ['products', 'warehouses', 'lots', 'weighings'],
-    'MOD-SAL': ['customers', 'salesInvoices', 'orders'],
+    // Inventari: magazina, prodhimi, paketimi, makineritë/dhomat, lëvizjet e stokut, kthimet, gjurmueshmëria
+    'MOD-INV': ['products', 'warehouses', 'racks', 'machines', 'lots', 'weighings', 'processes', 'packagings',
+      'stockMovements', 'inventories', 'inventoryTransfers', 'customerReturns', 'supplierReturns', 'alphaMasters'],
+    // Shitjet: klientë, porosi, mostra, fatura shitjeje, ngarkesa, dosje eksporti, dokumente
+    'MOD-SAL': ['customers', 'salesInvoices', 'orders', 'samples', 'shipments', 'exportDossiers', 'documents',
+      'documentSets', 'deletedExportIds', 'deletedExportRecords', 'deletedSalesRows'],
+    // Blerjet: furnitorë, fatura blerjeje
     'MOD-PUR': ['suppliers', 'purchaseInvoices'],
-    'MOD-FIN': ['payments', 'customerPayments'],
+    // Financa: pagesa, arkëtime, banka, kontabiliteti, arka
+    'MOD-FIN': ['payments', 'customerPayments', 'bankTransactions', 'bankAccounts', 'accounting', 'cashRegisters'],
+    // Administrimi: përdoruesit
     'MOD-SET': ['users'],
   },
 };
+
+// Fushat e përbashkëta të aplikacionit (ditari, cilësimet, sekuencat, backup-i, meta) — i takojnë çdo
+// përdoruesi që ka qasje në server, pavarësisht grupit.
+const SHARED_STATE_FIELDS = ['events', 'settings', 'security', 'autoBackup', 'meta', 'sequences', 'companyProfile',
+  'labelSettings', 'printSettings', 'reportSettings', 'dashboardSettings', 'analytics', 'notes', 'tasks', 'notifications'];
+
+// Politika e sinkronizimit: "të gjitha modulet për këdo që ka qasje në server" (vendim i pronarit, 2026-09-13).
+// Një përdorues i vlefshëm i serverit sinkronizon TË GJITHË gjendjen e aplikacionit (të gjitha modulet operacionale);
+// vetëm fushat e administrimit (users) mbeten të rezervuara për Administratorin. Grupet vazhdojnë të përcaktojnë
+// të drejtat brenda aplikacionit (butona/menu) dhe modelet e tjera të API-t (audit, admin/users).
+const SYNC_ALL_MODULES_FOR_SERVER_USERS = String(process.env.SYNC_ALL_MODULES || 'true').toLowerCase() !== 'false';
+const ADMIN_ONLY_STATE_FIELDS = ['users'];
 
 // Roli ROLE-ADMIN është "superuser" (si uid=1 në Odoo): bypass i plotë.
 function isSuperuser(user) {
@@ -116,24 +135,42 @@ async function stateModules(userId, pool) {
   const moduleIds = Array.from(new Set(rows.map((r) => r.module_id)));
   const allowedFields = new Set();
   const fieldMap = (MODEL_MODULES.app_state || {});
-  for (const mid of moduleIds) {
-    const fields = fieldMap[mid];
-    if (Array.isArray(fields)) fields.forEach((f) => allowedFields.add(f));
-    else allowedFields.add(mid); // modul pa hartë fushash (i ardhshëm): lejohet me emër
+  if (SYNC_ALL_MODULES_FOR_SERVER_USERS) {
+    // Çdo përdorues i serverit: të gjitha modulet operacionale + fushat e përbashkëta (pa 'users').
+    for (const mid of Object.keys(fieldMap)) {
+      if (mid === 'MOD-SET') continue;
+      fieldMap[mid].forEach((f) => allowedFields.add(f));
+    }
+    SHARED_STATE_FIELDS.forEach((f) => allowedFields.add(f));
+    // Nëse grupi i tij i jep MOD-SET (Administrimi/Përdorues), shton edhe fushat e atij moduli.
+    if (moduleIds.includes('MOD-SET')) fieldMap['MOD-SET'].forEach((f) => allowedFields.add(f));
+  } else {
+    for (const mid of moduleIds) {
+      const fields = fieldMap[mid];
+      if (Array.isArray(fields)) fields.forEach((f) => allowedFields.add(f));
+      else allowedFields.add(mid); // modul pa hartë fushash (i ardhshëm): lejohet me emër
+    }
+    SHARED_STATE_FIELDS.forEach((f) => allowedFields.add(f));
   }
   return {
     full: false,
+    allowAllOperational: SYNC_ALL_MODULES_FOR_SERVER_USERS,
     allowedModules: moduleIds.sort(),
     allowedFields: Array.from(allowedFields).sort(),
   };
 }
 
 // Zbaton filtrin e moduleve mbi një objekt gjendjeje: ruan vetëm fushat e lejuara.
+// Me politikën "të gjitha modulet": kalon çdo fushë përveç atyre vetëm-për-admin (users) dhe atyre që
+// filtri nuk i lejon shprehimisht — kështu edhe fushat e reja të aplikacionit sinkronizohen pa ndryshuar serverin.
 function applyStateModules(state, filter) {
   if (!filter || filter.full || !state || typeof state !== 'object' || Array.isArray(state)) return state;
   const out = {};
   for (const k of Object.keys(state)) {
-    if (filter.allowedFields.includes(k)) out[k] = state[k];
+    if (filter.allowAllOperational) {
+      if (ADMIN_ONLY_STATE_FIELDS.includes(k) && !filter.allowedFields.includes(k)) continue;
+      out[k] = state[k];
+    } else if (filter.allowedFields.includes(k)) out[k] = state[k];
   }
   return out;
 }
@@ -160,4 +197,7 @@ module.exports = {
   applyStateModules,
   loadAccessContext,
   MODEL_MODULES,
+  SHARED_STATE_FIELDS,
+  ADMIN_ONLY_STATE_FIELDS,
+  SYNC_ALL_MODULES_FOR_SERVER_USERS,
 };

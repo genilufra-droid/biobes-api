@@ -86,26 +86,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const seen = stateSal.data.state;
   ok('sal-sees-customers', seen && Array.isArray(seen.customers) && seen.customers.length === 1);
   ok('sal-sees-orders', seen && Array.isArray(seen.orders));
-  ok('sal-not-see-products', seen && seen.products === undefined, 'products=' + JSON.stringify(seen && seen.products));
-  ok('sal-not-see-lots', seen && seen.lots === undefined);
+  // Politika "të gjitha modulet për përdoruesit e serverit": shitësi sheh edhe produktet/lotet (sync i plotë),
+  // por JO 'users' (vetëm-admin).
+  ok('sal-sees-products-too', seen && Array.isArray(seen.products) && seen.products.length === 1, 'products=' + JSON.stringify(seen && seen.products));
+  ok('sal-sees-lots-too', seen && Array.isArray(seen.lots));
+  ok('sal-not-see-users', seen && seen.users === undefined, 'users=' + JSON.stringify(seen && seen.users));
 
-  // Shitësi shkruan vetëm fushat e shitjeve — nuk fshin produktet e adminit.
-  const v = stateSal.data.version || 1; // versioni i plotë (mbetet i njëjtë në server)
-  const salWrite = { customers: [{ id: 'C1', code: 'C1', name: 'Klient', balance: 0 }, { id: 'C2', code: 'C2', name: 'Klient 2', balance: 0 }], salesInvoices: [], orders: [{ id: 'O1' }], products: [{ id: 'HACK', code: 'HACK', name: 'Hack', balance: 0 }] };
+  // Shitësi shkruan TË GJITHË gjendjen operacionale (si aplikacioni real) — 'users' i tij injorohet.
+  const v = stateSal.data.version || 1;
+  const salWrite = Object.assign({}, seen, { customers: [{ id: 'C1', code: 'C1', name: 'Klient', balance: 0 }, { id: 'C2', code: 'C2', name: 'Klient 2', balance: 0 }], orders: [{ id: 'O1' }], products: [{ id: 'P1', code: 'P1', name: 'Produkt' }, { id: 'P2', code: 'P2', name: 'Produkt 2' }], processes: [{ id: 'PR-1' }], packagings: [{ id: 'PK-1' }], users: [{ id: 'HACK-ADMIN', username: 'hack', role: 'ROLE-ADMIN' }] });
   const putSal = await call('/api/state', { method: 'PUT', headers: HS, body: JSON.stringify({ state: salWrite, baseVersion: v }) });
   ok('sal-put-ok', putSal.ok, JSON.stringify(putSal.data));
 
-  // Admini duhet të shohë: produktet e tij TË PAPREKURA, por klientët e përditësuar.
+  // Admini duhet të shohë: produktet, klientët, proceset dhe paketimet e përditësuara; 'users' të paprekur.
   const stateAdmin = await call('/api/state', { headers: HA });
   const as = stateAdmin.data.state;
-  ok('admin-products-untouched', as.products.length === 1 && as.products[0].id === 'P1');
+  ok('admin-products-updated', as.products.length === 2 && as.products.some((c) => c.id === 'P2'));
   ok('admin-customers-updated', as.customers.length === 2 && as.customers.some((c) => c.id === 'C2'));
-  ok('admin-no-hack-product', !as.products.some((c) => c.id === 'HACK'));
+  ok('admin-processes-packagings-synced', Array.isArray(as.processes) && as.processes.some((x) => x.id === 'PR-1') && Array.isArray(as.packagings) && as.packagings.some((x) => x.id === 'PK-1'));
+  ok('admin-users-untouched', !(as.users || []).some((u) => u.id === 'HACK-ADMIN'));
 
-  // Përdoruesi pa grup: gjendja është bosh, asnjë modul.
+  // Përdoruesi pa grup: sheh gjendjen operacionale (sync i plotë), pa 'users'; asnjë modul (të drejta) në UI.
   const N = await login('none', 'nonesecret1');
   const stateNone = await call('/api/state', { headers: { Authorization: 'Bearer ' + N.data.token } });
-  ok('none-empty-state', stateNone.ok && stateNone.data.state && Object.keys(stateNone.data.state).length === 0, JSON.stringify(stateNone.data.state));
+  ok('none-sees-operational-state', stateNone.ok && stateNone.data.state && Array.isArray(stateNone.data.state.customers) && stateNone.data.state.users === undefined, JSON.stringify(Object.keys(stateNone.data.state || {})));
   ok('none-no-modules', stateNone.data.modules && stateNone.data.modules.allowedModules.length === 0);
 
   // Autorizimi: shitësi s'ka qasje te administrimi.

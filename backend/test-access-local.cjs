@@ -53,7 +53,10 @@ const ok = (name, cond, extra = '') => { cond ? pass++ : fail++; console.log((co
   await db.query(`INSERT INTO user_groups(user_id,group_id) VALUES('USR-SAL','GRP-SAL-USER')`);
   const salMods = await access.stateModules('USR-SAL', pool);
   ok('sal-modules', salMods && !salMods.full && JSON.stringify(salMods.allowedModules) === JSON.stringify(['MOD-SAL']), JSON.stringify(salMods && salMods.allowedModules));
-  ok('sal-fields', salMods && JSON.stringify(salMods.allowedFields) === JSON.stringify(['customers', 'orders', 'salesInvoices']), JSON.stringify(salMods && salMods.allowedFields));
+  // Politika "të gjitha modulet për përdoruesit e serverit": fushat e MOD-SAL + të gjitha modulet e tjera operacionale
+  // + fushat e përbashkëta; 'users' (MOD-SET) NUK përfshihet pa grupin përkatës.
+  const salF = (salMods && salMods.allowedFields) || [];
+  ok('sal-fields', ['customers', 'orders', 'salesInvoices', 'processes', 'packagings', 'machines', 'shipments', 'exportDossiers', 'bankTransactions', 'accounting', 'events'].every((f) => salF.includes(f)) && !salF.includes('users'), JSON.stringify(salF));
 
   // 7) Menaxher shitjesh: GRP-SAL-MGR nënkupton GRP-SAL-USER.
   await db.query(`INSERT INTO users(id,username,name,role,password_hash) VALUES('USR-SALM','salmgr','Menaxher','ROLE-USER','x')`);
@@ -78,7 +81,10 @@ const ok = (name, cond, extra = '') => { cond ? pass++ : fail++; console.log((co
   // 10) Filtri i gjendjes.
   const full = { products: [1], suppliers: [2], customers: [3], warehouses: [4], lots: [5], weighings: [6], purchaseInvoices: [7], salesInvoices: [8], orders: [9], payments: [10], customerPayments: [11], users: [12] };
   const filtered = access.applyStateModules(full, salMods);
-  ok('filter-sales-only', JSON.stringify(Object.keys(filtered).sort()) === JSON.stringify(['customers', 'orders', 'salesInvoices']), JSON.stringify(Object.keys(filtered)));
+  ok('filter-all-operational-no-users', JSON.stringify(Object.keys(filtered).sort()) === JSON.stringify(Object.keys(full).filter((k) => k !== 'users').sort()), JSON.stringify(Object.keys(filtered)));
+  // Fushë e re/e panjohur e aplikacionit kalon (sinkronizohet), 'users' jo.
+  const filteredExtra = access.applyStateModules({ users: [1], brandNewModule: [2] }, salMods);
+  ok('filter-new-field-passes-users-blocked', filteredExtra.brandNewModule !== undefined && filteredExtra.users === undefined, JSON.stringify(filteredExtra));
   ok('filter-full-passthrough', access.applyStateModules(full, null) === full);
 
   // 11) recordMatchesDomain.
@@ -99,12 +105,12 @@ const ok = (name, cond, extra = '') => { cond ? pass++ : fail++; console.log((co
 
   // 13) Merge-i i shkrimit të kufizuar (si në PUT /api/state).
   const serverFull = { products: [{ id: 'P1' }], suppliers: [], customers: [{ id: 'C-OLD' }], warehouses: [], lots: [], weighings: [], purchaseInvoices: [], salesInvoices: [], orders: [], payments: [], customerPayments: [], users: [] };
-  const incoming = { products: [{ id: 'HACK' }], customers: [{ id: 'C-NEW' }], salesInvoices: [], orders: [], extraUnknown: 1 };
-  const scopedIncoming = access.applyStateModules(incoming, salMods); // hiq products + extraUnknown
+  const incoming = { products: [{ id: 'P1' }, { id: 'P2' }], customers: [{ id: 'C-NEW' }], salesInvoices: [], orders: [], users: [{ id: 'HACK-ADMIN' }] };
+  const scopedIncoming = access.applyStateModules(incoming, salMods); // hiq vetëm 'users' (vetëm-admin)
   const merged = Object.assign({}, serverFull, scopedIncoming);
-  ok('merge-keeps-products', JSON.stringify(merged.products) === JSON.stringify([{ id: 'P1' }]));
+  ok('merge-updates-products', JSON.stringify(merged.products) === JSON.stringify([{ id: 'P1' }, { id: 'P2' }]));
   ok('merge-updates-customers', JSON.stringify(merged.customers) === JSON.stringify([{ id: 'C-NEW' }]));
-  ok('merge-strips-foreign', merged.extraUnknown === undefined && !('products' in scopedIncoming));
+  ok('merge-strips-users', JSON.stringify(merged.users) === JSON.stringify(serverFull.users) && !('users' in scopedIncoming));
 
   // 14) Idempotenca e seed-it: 006 i dytë nuk duhet të dublojë.
   await db.exec(fs.readFileSync(path.join(dir, '006_odoo_access.sql'), 'utf8'));
