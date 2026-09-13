@@ -98,8 +98,12 @@ app.get('/api/auth/me', needDb, needAuth, async (req, res) => {
 
 app.get('/api/state/version', needDb, needAuth, async (req, res) => {
   try {
-    const { rows } = await getPool().query("SELECT version,updated_at FROM app_state WHERE id='main'");
-    res.json({ ok: true, version: rows.length ? rows[0].version : 0, updatedAt: rows.length ? rows[0].updated_at : null });
+    const p = getPool();
+    const [{ rows }, wipe] = await Promise.all([
+      p.query("SELECT version,updated_at FROM app_state WHERE id='main'"),
+      p.query("SELECT value FROM meta WHERE key='wiped_at'").catch(() => ({ rows: [] })),
+    ]);
+    res.json({ ok: true, version: rows.length ? rows[0].version : 0, updatedAt: rows.length ? rows[0].updated_at : null, wipedAt: wipe.rows[0]?.value || null });
   } catch (e) { console.error('[state:version]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
@@ -212,24 +216,21 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
 
     const wrow = await p.query("SELECT value FROM meta WHERE key='wiped_at'");
     const wipedMark = wrow.rows.length ? wrow.rows[0].value : null;
-    const clearWipeMark = async () => { try { await p.query("DELETE FROM meta WHERE key='wiped_at'"); } catch (e) {} };
     if (wipedMark && wipeAck !== wipedMark) {
       return res.status(409).json({ ok: false, error: 'Serveri u pastrua totalisht — pajisja duhet të pastrohet ose të rifillojë epokën', wiped: true, wipedAt: wipedMark });
     }
+    // Phase 1 cloud safety: every normal state write is optimistic-concurrency guarded.
+    // A missing baseVersion is never allowed to overwrite the current server state.
     if (baseVersion === undefined || baseVersion === null) {
-      // Blind write (first push / legacy client): single-statement atomic increment.
-      const r = await p.query(
-        `INSERT INTO app_state(id,data,version,updated_at) VALUES('main',$1::jsonb,1,NOW())
-         ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,version=app_state.version+1,updated_at=NOW() RETURNING version`,
-        [raw]
-      );
-      const ver = r.rows[0].version;
-      await audit(req.user.username, 'STATE_PUT', 'version ' + ver + ' (blind)' + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')));
-      await clearWipeMark();
-      return res.json({ ok: true, version: ver, updatedAt: new Date().toISOString() });
+      await audit(req.user.username, 'STATE_PUT_REJECTED', 'missing baseVersion');
+      return res.status(400).json({
+        ok: false,
+        code: 'BASE_VERSION_REQUIRED',
+        error: 'baseVersion është i detyrueshëm — merrni fillimisht /api/state'
+      });
     }
-    if (!Number.isFinite(+baseVersion)) {
-      return res.status(400).json({ ok: false, error: 'baseVersion i pavlefshëm' });
+    if (!Number.isInteger(Number(baseVersion)) || Number(baseVersion) < 0) {
+      return res.status(400).json({ ok: false, code: 'BASE_VERSION_INVALID', error: 'baseVersion i pavlefshëm' });
     }
     // Atomic compare-and-swap: check + write in ONE statement, no lost-update race.
     const r = await p.query(
@@ -248,7 +249,6 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
         );
         if (ins.rows.length) {
           await audit(req.user.username, 'STATE_PUT', 'version 1 (init)');
-          await clearWipeMark();
           return res.json({ ok: true, version: 1, updatedAt: new Date().toISOString() });
         }
       }
@@ -258,7 +258,6 @@ app.put('/api/state', needDb, needAuth, async (req, res) => {
     }
     const ver = r.rows[0].version;
     await audit(req.user.username, 'STATE_PUT', 'version ' + ver + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')));
-    await clearWipeMark();
     res.json({ ok: true, version: ver, updatedAt: new Date().toISOString() });
   } catch (e) { console.error('[state:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
