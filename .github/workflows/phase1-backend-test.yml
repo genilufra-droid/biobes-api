@@ -6,6 +6,7 @@ on:
       - chatgpt/faza1-cloud-sync
     paths:
       - .github/workflows/phase1-backend-test.yml
+      - backend/test-concurrent.js
 
 jobs:
   test:
@@ -20,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
       - name: Syntax
-        run: node --check server.js
+        run: node --check server.js && node --check test-concurrent.js
       - name: Access tests
         run: npm run test:access
       - name: E2E tests
