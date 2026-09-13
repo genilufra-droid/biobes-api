@@ -71,7 +71,7 @@ async function audit(actor, action, detail) {
 }
 
 app.get('/api/health', async (req, res) => {
-  res.json({ ok: true, db: await dbOk(), version: 1, time: new Date().toISOString() });
+  res.json({ ok: true, db: await dbOk(), version: 1, syncPolicy: access.SYNC_ALL_MODULES_FOR_SERVER_USERS ? 'all-modules' : 'per-group', time: new Date().toISOString() });
 });
 
 app.post('/api/auth/login', rateLimit(10, 15 * 60 * 1000), needDb, async (req, res) => {
