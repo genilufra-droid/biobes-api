@@ -84,11 +84,11 @@ async function userFromToken(token) {
 }
 
 // Grupet efektive të një përdoruesi (përfshirë implikimet) — për admin/përgjigje.
-async function groupsForUser(userId, pool) {
+async function groupsForUser(userId, pool, companyId) {
   try {
     const { resolveGroups } = require('./access');
     const p = pool || getPool();
-    const ids = await resolveGroups(userId, p);
+    const ids = await resolveGroups(userId, p, companyId);
     const { rows } = await p.query('SELECT id, name, full_name, module_id FROM access_groups WHERE id = ANY($1::text[]) ORDER BY full_name', [Array.from(ids)]);
     return rows;
   } catch (e) { console.error('[auth] groupsForUser:', e.message); return []; }

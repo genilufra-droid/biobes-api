@@ -41,9 +41,14 @@ function isSuperuser(user) {
 
 // Zgjidh grupet e përdoruesit duke përfshirë implikimet (implied_group_ids),
 // rekurzivisht — si metoda `_expand_groups` e Odo-s.
-async function resolveGroups(userId, pool) {
+async function resolveGroups(userId, pool, companyId) {
   const p = pool || getPool();
-  const direct = await p.query('SELECT group_id FROM user_groups WHERE user_id=$1', [userId]);
+  // Të drejtat per kompani: merren rreshtat e kompanisë + ato globale (company_id NULL).
+  // Pa companyId (sjellje e vjetër) merren vetëm rreshtat globalë.
+  const cid = companyId ? String(companyId) : null;
+  const direct = cid
+    ? await p.query('SELECT group_id FROM user_groups WHERE user_id=$1 AND (company_id IS NULL OR company_id=$2)', [userId, cid])
+    : await p.query('SELECT group_id FROM user_groups WHERE user_id=$1 AND company_id IS NULL', [userId]);
   const result = new Set(direct.rows.map((r) => r.group_id));
   let frontier = Array.from(result);
   let guard = 0;
@@ -63,10 +68,10 @@ async function resolveGroups(userId, pool) {
 
 // Të drejtat efektive mbi një model (si `ir.model.access::check`): OR-i i të
 // gjitha grupeve të përdoruesit për modelin e kërkuar.
-async function modelAccess(userId, model, pool) {
+async function modelAccess(userId, model, pool, companyId) {
   if (!userId) return null;
   const p = pool || getPool();
-  const groupIds = await resolveGroups(userId, p);
+  const groupIds = await resolveGroups(userId, p, companyId);
   const { rows } = await p.query(
     `SELECT bool_or(perm_read)  AS "read",
             bool_or(perm_write) AS "write",
@@ -121,9 +126,9 @@ function recordMatchesDomain(record, domain) {
 
 // Modulet (aplikacionet) që sheh përdoruesi mbi modelin app_state: ato që kanë
 // të paktën një grup të përdoruesit me lexim app_state.
-async function stateModules(userId, pool) {
+async function stateModules(userId, pool, companyId) {
   const p = pool || getPool();
-  const groupIds = await resolveGroups(userId, p);
+  const groupIds = await resolveGroups(userId, p, companyId);
   if (groupIds.has('GRP-SET-ADMIN')) return null; // Administrator → gjithë modulet
 
   const { rows } = await p.query(
@@ -176,13 +181,13 @@ function applyStateModules(state, filter) {
 }
 
 // Paketa që i jepet serverit për një user të autentikuar (cached në req).
-async function loadAccessContext(user, pool) {
+async function loadAccessContext(user, pool, companyId) {
   if (!user || !user.id) return { user, superuser: false, modules: null, allowedModules: [] };
   const p = pool || getPool();
   if (isSuperuser(user)) {
     return { user, superuser: true, modules: null, allowedModules: [] };
   }
-  const modules = await stateModules(user.id, p);
+  const modules = await stateModules(user.id, p, companyId);
   return { user, superuser: false, modules, allowedModules: modules ? modules.allowedModules : [] };
 }
 
