@@ -450,6 +450,67 @@ app.post('/api/admin/wipe', rateLimit(10, 15 * 60 * 1000), needDb, async (req, r
   } catch (e) { console.error('[wipe]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
+// ===== Backup-et me datë në server (Postgres) — vetëm admin =================
+// Çdo backup = kopje e app_state me datë/autor/version; mbahen N të fundit.
+// Rikthimi krijon më parë një backup automatik të gjendjes aktuale (safety net).
+const BACKUP_KEEP = +(process.env.BACKUP_KEEP || 14);
+app.get('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const { rows } = await getPool().query('SELECT id,taken_at,label,taken_by,state_version,size_bytes FROM backups ORDER BY taken_at DESC, id DESC LIMIT 50');
+    res.json({ ok: true, backups: rows, keep: BACKUP_KEEP });
+  } catch (e) { console.error('[backups:list]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+app.post('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const p = getPool();
+    const cur = await p.query("SELECT data,version FROM app_state WHERE id='main'");
+    if (!cur.rows.length) return res.status(409).json({ ok: false, error: 'Serveri nuk ka ende gjendje për backup' });
+    const raw = JSON.stringify(cur.rows[0].data);
+    if (raw.length > MAX_STATE_BYTES) return res.status(413).json({ ok: false, error: 'Gjendja tejkalon 25 MB' });
+    const label = String((req.body || {}).label || '').slice(0, 120);
+    const r = await p.query('INSERT INTO backups(label,taken_by,state_version,size_bytes,payload) VALUES($1,$2,$3,$4,$5::jsonb) RETURNING id,taken_at',
+      [label, req.user.username, cur.rows[0].version || 0, raw.length, raw]);
+    await p.query('DELETE FROM backups WHERE id NOT IN (SELECT id FROM backups ORDER BY taken_at DESC, id DESC LIMIT ' + BACKUP_KEEP + ')');
+    await audit(req.user.username, 'BACKUP_SERVER', 'id ' + r.rows[0].id + (label ? ' / ' + label : ''));
+    res.json({ ok: true, id: r.rows[0].id, takenAt: r.rows[0].taken_at });
+  } catch (e) { console.error('[backups:create]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+app.get('/api/backups/:id', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const { rows } = await getPool().query('SELECT id,taken_at,label,taken_by,state_version,size_bytes,payload FROM backups WHERE id=$1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Backup-i nuk u gjet' });
+    const b = rows[0];
+    res.json({ ok: true, backup: { id: b.id, takenAt: b.taken_at, label: b.label, takenBy: b.taken_by, stateVersion: b.state_version, sizeBytes: b.size_bytes, state: b.payload } });
+  } catch (e) { console.error('[backups:get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+app.post('/api/backups/:id/restore', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const p = getPool();
+    const src = await p.query('SELECT payload FROM backups WHERE id=$1', [req.params.id]);
+    if (!src.rows.length) return res.status(404).json({ ok: false, error: 'Backup-i nuk u gjet' });
+    const v = validateState(src.rows[0].payload);
+    if (!v.ok) return res.status(400).json({ ok: false, error: 'Backup-i i zgjedhur është i pavlefshëm: ' + v.errors[0] });
+    const cur = await p.query("SELECT data,version FROM app_state WHERE id='main'");
+    if (cur.rows.length) {
+      const rawNow = JSON.stringify(cur.rows[0].data);
+      await p.query("INSERT INTO backups(label,taken_by,state_version,size_bytes,payload) VALUES('auto-para-rikthimit',$1,$2,$3,$4::jsonb)", [req.user.username, cur.rows[0].version || 0, rawNow.length, rawNow]);
+    }
+    const raw = JSON.stringify(src.rows[0].payload);
+    const r = await p.query("INSERT INTO app_state(id,data,version,updated_at) VALUES('main',$1::jsonb,1,NOW()) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,version=app_state.version+1,updated_at=NOW() RETURNING version", [raw]);
+    await p.query('DELETE FROM backups WHERE id NOT IN (SELECT id FROM backups ORDER BY taken_at DESC, id DESC LIMIT ' + BACKUP_KEEP + ')');
+    await audit(req.user.username, 'RESTORE_SERVER', 'nga backup id ' + req.params.id + ' → version ' + r.rows[0].version);
+    res.json({ ok: true, version: r.rows[0].version });
+  } catch (e) { console.error('[backups:restore]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+app.delete('/api/backups/:id', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const r = await getPool().query('DELETE FROM backups WHERE id=$1', [req.params.id]);
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'Backup-i nuk u gjet' });
+    await audit(req.user.username, 'BACKUP_DELETE', 'id ' + req.params.id);
+    res.json({ ok: true });
+  } catch (e) { console.error('[backups:delete]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
