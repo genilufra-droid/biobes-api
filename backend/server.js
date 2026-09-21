@@ -305,6 +305,123 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
   } catch (e) { console.error('[state:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
+// ===== Ruajtja PËR DOKUMENT (F2.3) ==========================================
+// Në vend që pajisja tё dërgojë gjithё gjendjen (~2.7 MB), dërgon vetёm dokumentet
+// e ndryshuara: [{kind:'suppliers', op:'upsert'|'delete', id, doc}]. Serveri i
+// aplikon brenda njё transaksioni me bllokim rreshti (FOR UPDATE), rrit versionin,
+// njofton pajisjet e tjera (SSE) dhe kthen versionin e ri — pa mbishkrime tё fshehta.
+const PATCH_MAX_OPS = 500;
+const PATCH_MAX_BYTES = 1024 * 1024;
+
+const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+
+// Kontroll PËR DOKUMENT: nëse op-i sjell `prev` (vlera që pajisja mendon se ka
+// serveri), atëherë krahasohet me vlerën aktuale BRENDA transaksionit. Kështu dy
+// pajisje që shkruajnë dokumente TË NDRYSHME kalojnë të dyja pa konflikt, ndërsa
+// për dokumentin E NJËJTË zbulohet mbishkrimi dhe kërkohet ringarkim/paraqitje.
+function applyStateOps(base, ops, allowedFields) {
+  const next = Object.assign({}, base || {});
+  let changed = 0;
+  for (const raw of ops) {
+    const op = raw || {};
+    const kind = String(op.kind || '');
+    if (!kind) { const e = new Error('Dokumenti pa fushë (kind)'); e.code = 400; throw e; }
+    if (allowedFields && !allowedFields.includes(kind)) { const e = new Error('Nuk keni të drejtë për fushën ' + kind); e.code = 403; throw e; }
+    const hasPrev = Object.prototype.hasOwnProperty.call(op, 'prev');
+    if (op.op === 'set') {                       // vlerë e vetme (meta, settings, …)
+      if (hasPrev && !same(next[kind], op.prev)) { const e = new Error('Dokumenti u ndryshua nga një përdorues tjetër'); e.code = 409; e.kind = kind; e.current = next[kind]; throw e; }
+      if (!same(next[kind], op.doc)) { next[kind] = op.doc; changed++; }
+      continue;
+    }
+    if (!Array.isArray(next[kind])) {
+      if (op.op === 'delete') continue;          // asgjë për të fshirë
+      next[kind] = [];
+    }
+    const id = String(op.id == null ? '' : op.id);
+    if (!id) { const e = new Error('Dokumenti pa identifikues (id)'); e.code = 400; throw e; }
+    const list = next[kind];
+    const at = list.findIndex((x) => x && String(x.id) === id);
+    const current = at >= 0 ? list[at] : null;
+    if (hasPrev && !same(current, op.prev || null)) {
+      const e = new Error('Dokumenti u ndryshua nga një përdorues tjetër');
+      e.code = 409; e.kind = kind; e.id = id; e.current = current; throw e;
+    }
+    if (op.op === 'delete') {
+      if (at >= 0) { list.splice(at, 1); changed++; }
+      continue;
+    }
+    if (op.op !== 'upsert') { const e = new Error('Veprim i panjohur: ' + op.op); e.code = 400; throw e; }
+    if (!op.doc || typeof op.doc !== 'object' || Array.isArray(op.doc)) { const e = new Error('Dokumenti i pavlefshëm'); e.code = 400; throw e; }
+    if (at >= 0) {
+      if (!same(list[at], op.doc)) { list[at] = op.doc; changed++; }
+    } else { list.push(op.doc); changed++; }
+  }
+  return { next, changed };
+}
+
+app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (req, res) => {
+  try {
+    const COMPANY = req.company;
+    const ops = (req.body && req.body.ops) || null;
+    const baseVersion = req.body ? req.body.baseVersion : undefined;
+    if (!Array.isArray(ops) || !ops.length) return res.status(400).json({ ok: false, error: 'Kërkohet lista `ops`' });
+    if (ops.length > PATCH_MAX_OPS) return res.status(413).json({ ok: false, error: 'Shumë ndryshime njëherësh (' + ops.length + ' > ' + PATCH_MAX_OPS + ')' });
+    const rawOps = JSON.stringify(ops);
+    if (rawOps.length > PATCH_MAX_BYTES) return res.status(413).json({ ok: false, error: 'Ndryshimet tejkalojnë 1 MB — përdoret ruajtja e plotë' });
+
+    const p = getPool();
+    const allowedFields = (req.access && req.access.superuser === false && req.access.modules) ? req.access.modules.allowedFields : null;
+
+    const wipedMark = await companies.getWipeMark(p, COMPANY);
+    const wipeAck = req.body ? req.body.wipeAck : null;
+    if (wipedMark && wipeAck !== wipedMark) {
+      return res.status(409).json({ ok: false, error: 'Serveri u pastrua totalisht — pajisja duhet të pastrohet', wiped: true, wipedAt: wipedMark });
+    }
+
+    // Transaksion + bllokim rreshti: dy pajisje që shkruajnë dokumente të ndryshme
+    // nuk mbishkruajnë njëra-tjetrën (pa humbje të dhënash).
+    const client = await p.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query('SELECT data,version FROM app_state WHERE id=$1 FOR UPDATE', [COMPANY]);
+      if (!cur.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ ok: false, error: 'Serveri nuk ka gjendje — dërgohet e plotë', empty: true, version: 0 });
+      }
+      const version = cur.rows[0].version;
+      // Versioni global është KËSHILLUES: ndryshimet janë incrementale (per dokument),
+      // ndaj një version i vjetër nuk e humb punën e askujt. Konflikti zbulohet vetëm
+      // për dokumentin e njëjtë, kur op-i sjell `prev` (shih applyStateOps).
+      let out;
+      try { out = applyStateOps(cur.rows[0].data, ops, allowedFields); }
+      catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.code || 400).json({
+          ok: false, error: e.message, conflict: e.code === 409, kind: e.kind, id: e.id, current: e.current, version,
+        });
+      }
+      const data = out.next;
+      const vfull = validateState(data);
+      if (!vfull.ok) { await client.query('ROLLBACK'); return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vfull.errors[0] }); }
+      const raw = JSON.stringify(data);
+      if (raw.length > MAX_STATE_BYTES) { await client.query('ROLLBACK'); return res.status(413).json({ ok: false, error: 'State tejkalon 25 MB' }); }
+      const upd = await client.query('UPDATE app_state SET data=$1::jsonb,version=version+1,updated_at=NOW() WHERE id=$2 RETURNING version', [raw, COMPANY]);
+      await client.query('COMMIT');
+      const ver = upd.rows[0].version;
+      const kinds = Array.from(new Set(ops.map((o) => String(o.kind)))).join(',');
+      await audit(req.user.username, 'STATE_PATCH', 'company ' + COMPANY + ' version ' + ver + ' / ' + out.changed + ' ndryshime / ' + kinds, COMPANY);
+      await companies.clearWipeMark(p, COMPANY).catch(() => {});
+      events.stateChanged(COMPANY, ver, req.user.username, { patch: true, ops: out.changed, kinds });
+      return res.json({ ok: true, version: ver, company: COMPANY, applied: out.changed, kinds });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_e) {}
+      throw e;
+    } finally {
+      try { client.release(); } catch (e) {}
+    }
+  } catch (e) { console.error('[state:patch]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
 app.get('/api/audit', needDb, needAuth, needAccess('audit', 'read'), async (req, res) => {
   try {
     const lim = Math.min(Math.max(+req.query.limit || 100, 1), 500);
