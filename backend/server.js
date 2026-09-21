@@ -7,6 +7,8 @@ const { validateState } = require('./validateState');
 const { ensureAdmin, loginUser, userFromToken, logoutToken, rateLimit, verifyPassword, hashPassword, groupsForUser } = require('./auth');
 const access = require('./access');
 const companies = require('./companies');
+const events = require('./events');
+const zlib = require('zlib');
 
 const app = express();
 app.set('trust proxy', 1); // Render: IP reale e klientit për rate-limit
@@ -22,6 +24,28 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '30mb' }));
+
+// Kompresim gzip për përgjigjet JSON > 1 KB (gjendja është ~2.7 MB → shkarkohet
+// disa herë më shpejt). Pa varësi të reja: zlib i Node-it.
+app.use((req, res, next) => {
+  if (!/gzip/.test(String(req.headers['accept-encoding'] || ''))) return next();
+  const json = res.json.bind(res);
+  res.json = (body) => {
+    try {
+      const raw = Buffer.from(JSON.stringify(body));
+      if (raw.length > 1024) {
+        const gz = zlib.gzipSync(raw, { level: 6 });
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Vary', 'Accept-Encoding');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Length', gz.length);
+        return res.end(gz);
+      }
+    } catch (e) { /* në rast dështimi dërgohet e pakompresuar */ }
+    return json(body);
+  };
+  next();
+});
 
 function needDb(req, res, next) {
   if (!getPool()) return res.status(503).json({ ok: false, error: 'Databaza nuk është e lidhur (DATABASE_URL mungon)' });
@@ -231,6 +255,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
       const ver = r.rows[0].version;
       await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version ' + ver + ' (blind)' + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')), COMPANY);
       await clearWipeMark();
+      events.stateChanged(COMPANY, ver, req.user.username);
       return res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString() });
     }
     if (!Number.isFinite(+baseVersion)) {
@@ -254,6 +279,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
         if (ins.rows.length) {
           await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version 1 (init)', COMPANY);
           await clearWipeMark();
+          events.stateChanged(COMPANY, 1, req.user.username);
           return res.json({ ok: true, version: 1, company: COMPANY, updatedAt: new Date().toISOString() });
         }
       }
@@ -264,6 +290,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
     const ver = r.rows[0].version;
     await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version ' + ver + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')), COMPANY);
     await clearWipeMark();
+    events.stateChanged(COMPANY, ver, req.user.username);
     res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString() });
   } catch (e) { console.error('[state:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
@@ -443,6 +470,7 @@ app.patch('/api/access/users/:id/groups', needDb, needAuth, needAdminOnly, async
     const groups = await groupsForUser(u.id);
     const modules = await access.stateModules(u.id, p);
     await audit(req.user.username, 'ACCESS_UPDATE', u.username + ' / grupe=' + groupIds.join(','));
+    events.rightsChanged({ actor: req.user.username, username: u && u.username });
     res.json({ ok: true, user: u, groups, modules });
   } catch (e) { console.error('[access:user-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
@@ -494,6 +522,7 @@ app.post('/api/admin/companies', needDb, needAuth, needAdminOnly, async (req, re
         String(b.country || 'AL'), Number.isFinite(vat) ? vat : 20, cur]);
     await audit(req.user.username, 'COMPANY_CREATE', id + ' / ' + code + ' — ' + name, id);
     const list = await companies.listCompanies(p);
+    events.companiesChanged({ actor: req.user.username, company: id });
     res.json({ ok: true, company: list.find((c) => c.id === id) || null, companies: list });
   } catch (e) {
     if (String(e.message || '').includes('duplicate key')) return res.status(400).json({ ok: false, error: 'Kodi i kompanisë është i zënë' });
@@ -524,6 +553,7 @@ app.patch('/api/admin/companies/:id', needDb, needAuth, needAdminOnly, async (re
     await p.query('UPDATE companies SET ' + sets.join(', ') + ' WHERE id=$' + vals.length, vals);
     await audit(req.user.username, 'COMPANY_UPDATE', id + ' / ' + Object.keys(b).join(','), id);
     const list = await companies.listCompanies(p);
+    events.companiesChanged({ actor: req.user.username, company: id });
     res.json({ ok: true, company: list.find((c) => c.id === id) || null, companies: list });
   } catch (e) {
     if (String(e.message || '').includes('duplicate key')) return res.status(400).json({ ok: false, error: 'Kodi i kompanisë është i zënë' });
@@ -564,6 +594,7 @@ app.put('/api/admin/users/:id/companies', needDb, needAuth, needAdminOnly, async
     }
     await audit(req.user.username, 'COMPANY_MEMBERSHIP', u.rows[0].username + ' → ' + items.map((c) => c.id).join(',') + ' (default ' + dft + ')');
     const { rows } = await p.query('SELECT company_id,is_default FROM user_companies WHERE user_id=$1', [u.rows[0].id]);
+    events.companiesChanged({ actor: req.user.username, membershipOf: u.rows[0].username });
     res.json({ ok: true, user: u.rows[0], membership: rows.map((r) => ({ id: r.company_id, isDefault: !!r.is_default })) });
   } catch (e) { console.error('[users:companies:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
@@ -592,6 +623,7 @@ app.post('/api/admin/wipe', rateLimit(10, 15 * 60 * 1000), needDb, async (req, r
     if (company === companies.DEFAULT_COMPANY_ID) await p.query('DELETE FROM sessions WHERE user_id <> $1', [admin.id]);
     await audit(admin.username, 'WIPE', 'Fshirje e kompanisë ' + company + ' (u ruajt admini)', company);
     const wipedAt = await companies.getWipeMark(p, company);
+    events.wiped(company, wipedAt, admin.username);
     res.json({ ok: true, company, wipedAt });
   } catch (e) { console.error('[wipe]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
@@ -656,6 +688,7 @@ app.post('/api/backups/:id/restore', needDb, needAuth, needAdminOnly, async (req
     const r = await p.query('INSERT INTO app_state(id,company_id,data,version,updated_at) VALUES($1,$1,$2::jsonb,1,NOW()) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,version=app_state.version+1,updated_at=NOW() RETURNING version', [target, raw]);
     await p.query('DELETE FROM backups WHERE COALESCE(company_id,$1)=$1 AND id NOT IN (SELECT id FROM backups WHERE COALESCE(company_id,$1)=$1 ORDER BY taken_at DESC, id DESC LIMIT ' + BACKUP_KEEP + ')', [target]);
     await audit(req.user.username, 'RESTORE_SERVER', 'kompania ' + target + ' nga backup id ' + req.params.id + ' → version ' + r.rows[0].version, target);
+    events.stateChanged(target, r.rows[0].version, req.user.username);
     res.json({ ok: true, company: target, version: r.rows[0].version });
   } catch (e) { console.error('[backups:restore]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
@@ -667,6 +700,38 @@ app.delete('/api/backups/:id', needDb, needAuth, needAdminOnly, async (req, res)
     res.json({ ok: true });
   } catch (e) { console.error('[backups:delete]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
+
+// ===== Ngjarje në kohë reale (SSE) ==========================================
+// Pajisja hap një lidhje të vetme dhe merr njoftim të menjëhershëm kur ndryshon
+// gjendja e kompanisë së saj, kur krijohet/ndryshohet një kompani ose kur
+// ndryshojnë të drejtat. Token-i pranohet edhe si `?token=` sepse EventSource
+// nuk lejon header-a. Lidhja mbahet gjallë me 'ping' çdo 25 s.
+app.get('/api/events', needDb, async (req, res) => {
+  const tok = String(req.query.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+  const user = await userFromToken(tok).catch(() => null);
+  if (!user) return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
+  let superuser = true, mine = [];
+  try { const a = await access.loadAccessContext(user); superuser = a.superuser !== false; } catch (e) {}
+  try { const c = await companies.contextFor(user); mine = (c.companies || []).filter((x) => x.active !== false).map((x) => x.id); } catch (e) {}
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*',
+  });
+  res.write('retry: 2000\n\n');
+  res.write('event: hello\ndata: ' + JSON.stringify({ ok: true, user: user.username, companies: mine, superuser, at: new Date().toISOString() }) + '\n\n');
+  const client = { res, user, superuser, companies: mine, since: Date.now() };
+  events.add(client);
+  console.log('[events] + ' + user.username + ' (total ' + events.size() + ')');
+  let closed = false;
+  const close = () => { if (closed) return; closed = true; events.remove(client); try { res.end(); } catch (e) {} console.log('[events] - ' + user.username + ' (total ' + events.size() + ')'); };
+  req.on('close', close);
+  req.on('error', close);
+  res.on('error', close);
+});
+events.startHeartbeat();
 
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars

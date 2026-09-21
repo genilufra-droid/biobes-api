@@ -219,3 +219,16 @@ curl localhost:3000/api/health
 - `CORS_ORIGIN` = domain-i ekzakt i aplikacionit (nga `*`).
 - Domain personal: Render → Custom Domain te të dy serviset.
 - Plan me pagesë për API-n nëse "gjumi" i planit falas pengon.
+
+## Ngjarje në kohë reale (SSE) — /api/events
+
+- `GET /api/events?token=…` hap një lidhje të vazhdueshme (Server-Sent Events). Token-i
+  pranohet edhe si parametër sepse `EventSource` nuk lejon header-a; pa token → 401.
+- Ngjarjet: `hello` (kur hapet), `state-changed {company,version,actor,wiped?}`,
+  `companies-changed`, `rights-changed`. Lidhja mbahet gjallë me `: ping` çdo 25 s dhe
+  klienti rikontektohet vetë (`retry: 2000`).
+- Shpërndarja respekton anëtarësinë: superuser-i merr të gjitha kompanitë, përdoruesit e
+  tjerë vetëm kompanitë e tyre (prova: `test-events-local.cjs`).
+- Përgjigjet JSON > 1 KB kompresohen me gzip (gjendja ~2.7 MB → ~90% më e vogël).
+- Provat: `node test-events-local.cjs` (20 kontrolle) dhe `node test-realtime-load-local.cjs`
+  (20 përdorues njëkohësisht: 20 lidhje SSE, 10 shkrues paralelë, 0 humbje — 14 kontrolle).
