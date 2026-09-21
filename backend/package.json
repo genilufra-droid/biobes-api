@@ -8,11 +8,13 @@
     "start": "node server.js",
     "import": "node import-backup.js",
     "export": "node export-backup.js",
+    "export:company": "node export-company-backup.js",
     "test:live": "node test-live.js",
     "test:access": "node test-access-local.cjs",
     "test:e2e": "node test-e2e-local.cjs",
-    "demo:devices": "node demo-two-devices.js",
-    "test:concurrent": "node test-concurrent.js"
+    "test:bugs": "node test-bugs-fixes.cjs",
+    "test:multi": "node test-multi-company.cjs",
+    "demo:devices": "node demo-two-devices.js"
   },
   "engines": {
     "node": ">=18"

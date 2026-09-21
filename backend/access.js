@@ -17,15 +17,17 @@ const MODEL_MODULES = {
     'MOD-PUR': ['suppliers', 'purchaseInvoices'],
     // Financa: pagesa, arkëtime, banka, kontabiliteti, arka
     'MOD-FIN': ['payments', 'customerPayments', 'bankTransactions', 'bankAccounts', 'accounting', 'cashRegisters'],
-    // Administrimi: përdoruesit
-    'MOD-SET': ['users'],
+    // Administrimi: kompanitë, përdoruesit, konfigurimet globale
+    'MOD-SET': ['companies', 'users', 'settings', 'security', 'autoBackup', 'sequences', 'companyProfile',
+      'labelSettings', 'printSettings', 'reportSettings', 'dashboardSettings'],
   },
 };
 
 // Fushat e përbashkëta të aplikacionit (ditari, cilësimet, sekuencat, backup-i, meta) — i takojnë çdo
 // përdoruesi që ka qasje në server, pavarësisht grupit.
-const SHARED_STATE_FIELDS = ['events', 'settings', 'security', 'autoBackup', 'meta', 'sequences', 'companyProfile',
-  'labelSettings', 'printSettings', 'reportSettings', 'dashboardSettings', 'analytics', 'notes', 'tasks', 'notifications'];
+const SHARED_STATE_FIELDS = ['companies', 'events', 'settings', 'security', 'autoBackup', 'meta', 'sequences',
+  'companyProfile', 'labelSettings', 'printSettings', 'reportSettings', 'dashboardSettings',
+  'analytics', 'notes', 'tasks', 'notifications'];
 
 // Politika e sinkronizimit: "të gjitha modulet për këdo që ka qasje në server" (vendim i pronarit, 2026-09-13).
 // Një përdorues i vlefshëm i serverit sinkronizon TË GJITHË gjendjen e aplikacionit (të gjitha modulet operacionale);
