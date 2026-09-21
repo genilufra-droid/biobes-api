@@ -80,7 +80,7 @@ function needAccess(model, action) {
     try {
       if (!req.user) return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
       if (access.isSuperuser(req.user)) return next();
-      const a = await access.modelAccess(req.user.id, model);
+      const a = await access.modelAccess(req.user.id, model, null, req.company || null);
       if (!access.checkAccess(a, action)) {
         return res.status(403).json({ ok: false, error: 'Nuk keni të drejtë për këtë veprim (' + model + ':' + action + ')' });
       }
@@ -122,7 +122,17 @@ app.get('/api/auth/me', needDb, needAuth, async (req, res) => {
   try {
     const groups = await groupsForUser(req.user.id);
     const ctx = await companies.contextFor(req.user);
-    res.json({ ok: true, user: req.user, groups, modules: req.access.modules, superuser: req.access.superuser, ...ctx });
+    // Të drejtat per kompani: ?company=C2 kthen grupet/modulet e asaj kompanie.
+    const wanted = String((req.query && req.query.company) || '').trim();
+    let ctxCompany = wanted || ctx.defaultCompany || companies.DEFAULT_COMPANY_ID;
+    if (wanted) {
+      const a = await companies.assertCompanyAccess(req.user, wanted);
+      if (!a.ok) return res.status(a.code || 403).json({ ok: false, error: a.error });
+      ctxCompany = a.id;
+    }
+    let accessCtx = req.access;
+    if (!req.access || req.access.superuser === false) accessCtx = await access.loadAccessContext(req.user, null, ctxCompany);
+    res.json({ ok: true, user: req.user, groups, modules: accessCtx.modules, superuser: accessCtx.superuser, company: ctxCompany, ...ctx });
   } catch (e) { console.error('[auth:me]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
@@ -439,9 +449,17 @@ app.get('/api/access/users/:id/groups', needDb, needAuth, async (req, res) => {
     const p = getPool();
     const cur = await p.query('SELECT id FROM users WHERE id=$1', [req.params.id]);
     if (!cur.rows.length) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
-    const groups = await groupsForUser(req.params.id);
-    const modules = await access.stateModules(req.params.id, p);
-    res.json({ ok: true, groups, modules });
+    // Të drejtat per kompani: ?company=C2 kthen grupet e asaj kompanie (+ ato globale).
+    const wanted = String((req.query && req.query.company) || '').trim();
+    let company = null;
+    if (wanted) {
+      const a = await companies.assertCompanyAccess(req.user, wanted);
+      if (!a.ok) return res.status(a.code || 403).json({ ok: false, error: a.error });
+      company = a.id;
+    }
+    const groups = await groupsForUser(req.params.id, p, company);
+    const modules = await access.stateModules(req.params.id, p, company);
+    res.json({ ok: true, groups, modules, company });
   } catch (e) { console.error('[access:user-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
@@ -463,15 +481,31 @@ app.patch('/api/access/users/:id/groups', needDb, needAuth, needAdminOnly, async
     if (!Array.isArray(req.body.groups)) return res.status(400).json({ ok: false, error: 'Kërkohet lista `groups`' });
     let groupIds = req.body.groups.map((g) => String(g));
     if (u.role === 'ROLE-ADMIN' && !groupIds.includes('GRP-SET-ADMIN')) groupIds.push('GRP-SET-ADMIN');
-    await p.query('DELETE FROM user_groups WHERE user_id=$1', [u.id]);
-    for (const gid of groupIds) {
-      await p.query('INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [u.id, gid]);
+    // Të drejtat per kompani: company (në trup ose në adresë) shkruan rreshtat e asaj
+    // kompanie; pa company përditësohen vetëm rreshtat globalë (sjellja e vjetër).
+    const wanted = String((req.body && req.body.company) || (req.query && req.query.company) || '').trim();
+    let company = null;
+    if (wanted) {
+      const a = await companies.assertCompanyAccess(req.user, wanted);
+      if (!a.ok) return res.status(a.code || 403).json({ ok: false, error: a.error });
+      company = a.id;
     }
-    const groups = await groupsForUser(u.id);
-    const modules = await access.stateModules(u.id, p);
-    await audit(req.user.username, 'ACCESS_UPDATE', u.username + ' / grupe=' + groupIds.join(','));
-    events.rightsChanged({ actor: req.user.username, username: u && u.username });
-    res.json({ ok: true, user: u, groups, modules });
+    if (company) {
+      await p.query('DELETE FROM user_groups WHERE user_id=$1 AND company_id=$2', [u.id, company]);
+      for (const gid of groupIds) {
+        await p.query('INSERT INTO user_groups(user_id,group_id,company_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [u.id, gid, company]);
+      }
+    } else {
+      await p.query('DELETE FROM user_groups WHERE user_id=$1 AND company_id IS NULL', [u.id]);
+      for (const gid of groupIds) {
+        await p.query('INSERT INTO user_groups(user_id,group_id,company_id) VALUES($1,$2,NULL) ON CONFLICT DO NOTHING', [u.id, gid]);
+      }
+    }
+    const groups = await groupsForUser(u.id, p, company);
+    const modules = await access.stateModules(u.id, p, company);
+    await audit(req.user.username, 'ACCESS_UPDATE', u.username + ' / grupe=' + groupIds.join(',') + (company ? ' / kompania ' + company : ''), company);
+    events.rightsChanged({ actor: req.user.username, username: u && u.username, company });
+    res.json({ ok: true, user: u, groups, modules, company });
   } catch (e) { console.error('[access:user-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
