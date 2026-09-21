@@ -10,6 +10,8 @@
     "export": "node export-backup.js",
     "test:live": "node test-live.js",
     "test:access": "node test-access-local.cjs",
+    "test:migration008": "node test-migration-008-local.cjs",
+    "test:multicompany": "node test-multicompany-local.cjs",
     "test:e2e": "node test-e2e-local.cjs",
     "demo:devices": "node demo-two-devices.js",
     "test:concurrent": "node test-concurrent.js"
