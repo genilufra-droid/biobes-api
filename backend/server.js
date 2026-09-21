@@ -101,7 +101,9 @@ app.get('/api/health', async (req, res) => {
   res.json({ ok: true, db: await dbOk(), version: 1, syncPolicy: access.SYNC_ALL_MODULES_FOR_SERVER_USERS ? 'all-modules' : 'per-group', defaultCompany: companies.DEFAULT_COMPANY_ID, companies: companyCount, time: new Date().toISOString() });
 });
 
-app.post('/api/auth/login', rateLimit(10, 15 * 60 * 1000), needDb, async (req, res) => {
+// Login: kufi i gjerë per IP (mbrojtje nga skanimi) + kufi per PËRDORUES (10 tentativa/15 min),
+// që 20 përdorues në të njëjtën IP (zyrë/firmë) të mos bllokojnë njëri-tjetrin.
+app.post('/api/auth/login', rateLimit(60, 15 * 60 * 1000), rateLimit(10, 15 * 60 * 1000, (req) => (req.ip || '?') + ':u:' + String((req.body && req.body.username) || '').toLowerCase()), needDb, async (req, res) => {
   const { username, password } = req.body || {};
   let r;
   try { r = await loginUser(username, password); }
@@ -157,7 +159,7 @@ app.post('/api/auth/password', needDb, needAuth, async (req, res) => {
   } catch (e) { console.error('[auth:password]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.post('/api/auth/forgot', rateLimit(5, 15 * 60 * 1000), needDb, async (req, res) => {
+app.post('/api/auth/forgot', rateLimit(20, 15 * 60 * 1000), rateLimit(5, 15 * 60 * 1000, (req) => (req.ip || '?') + ':e:' + String((req.body && req.body.email) || '').toLowerCase()), needDb, async (req, res) => {
   try {
     const { isMailConfigured, sendResetCode } = require('./mailer');
     const un = String((req.body || {}).username || '').trim();
@@ -177,7 +179,7 @@ app.post('/api/auth/forgot', rateLimit(5, 15 * 60 * 1000), needDb, async (req, r
   } catch (e) { console.error('[auth:forgot]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.post('/api/auth/reset', rateLimit(10, 15 * 60 * 1000), needDb, async (req, res) => {
+app.post('/api/auth/reset', rateLimit(30, 15 * 60 * 1000), needDb, async (req, res) => {
   try {
     const { username, code, password } = req.body || {};
     if (!password || String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
@@ -218,7 +220,7 @@ app.get('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
   } catch (e) { console.error('[state:get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.put('/api/state', needDb, needAuth, companies.needCompany(), async (req, res) => {
+app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?'), async (req, res) => {
   try {
     const { state, baseVersion, wipeAck } = req.body || {};
     const COMPANY = req.company;
@@ -359,6 +361,48 @@ function applyStateOps(base, ops, allowedFields) {
   return { next, changed };
 }
 
+// --- Mbrojtja e numrave të brendshëm (F2.7) ---------------------------------
+// Numrat që sistemi i gjeneron vetë (FH-/FD- për dokumentet e magazinës, SHP- për
+// shpenzimet) llogariten në pajisje nga lista vendore; dy pajisje që krijojnë
+// dokument të të njëjtit lloj njëkohësisht mund të nxjerrin të njëjtin numër.
+// Serveri e refuzon vetëm DYFISHIMIN E RI (dokument i ri ose numër i ndryshuar) —
+// dyfishimet e vjetra në të dhëna nuk bllokojnë kurrë ruajtjen.
+const AUTO_NUMBER_KINDS = { stockDocs: 'number', expenses: 'number' };
+const AUTO_NUMBER_RE = /^[A-Z]{2,4}-\d{4}-\d{4}$/;
+function snapshotAutoNumbers(st) {
+  const out = {};
+  for (const kind of Object.keys(AUTO_NUMBER_KINDS)) {
+    const field = AUTO_NUMBER_KINDS[kind];
+    const m = new Map();
+    for (const d of (Array.isArray(st && st[kind]) ? st[kind] : [])) if (d && d.id != null) m.set(String(d.id), String(d[field] || ''));
+    out[kind] = m;
+  }
+  return out;
+}
+function findNewNumberDuplicate(prevNums, next) {
+  for (const kind of Object.keys(AUTO_NUMBER_KINDS)) {
+    const field = AUTO_NUMBER_KINDS[kind];
+    const nextList = Array.isArray(next && next[kind]) ? next[kind] : [];
+    const prevById = (prevNums && prevNums[kind]) || new Map();
+    const byNumber = new Map();
+    for (const d of nextList) {
+      if (!d || d.id == null) continue;
+      const num = String(d[field] || '');
+      if (!AUTO_NUMBER_RE.test(num)) continue;
+      if (!byNumber.has(num)) byNumber.set(num, []);
+      byNumber.get(num).push(d);
+    }
+    for (const [num, docs] of byNumber) {
+      if (docs.length < 2) continue;
+      for (const d of docs) {
+        const prevNum = prevById.get(String(d.id));
+        if (prevNum === undefined || prevNum !== num) return { kind, field, number: num, id: String(d.id) };
+      }
+    }
+  }
+  return null;
+}
+
 app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (req, res) => {
   try {
     const COMPANY = req.company;
@@ -392,6 +436,9 @@ app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (r
       // Versioni global është KËSHILLUES: ndryshimet janë incrementale (per dokument),
       // ndaj një version i vjetër nuk e humb punën e askujt. Konflikti zbulohet vetëm
       // për dokumentin e njëjtë, kur op-i sjell `prev` (shih applyStateOps).
+      // Vërejtje: applyStateOps e modifikon gjendjen NË VEND, ndaj fotografia e
+      // numrave merret përpara — përndryshe krahasimi "para/pas" nuk kap asgjë.
+      const prevNums = snapshotAutoNumbers(cur.rows[0].data);
       let out;
       try { out = applyStateOps(cur.rows[0].data, ops, allowedFields); }
       catch (e) {
@@ -401,6 +448,15 @@ app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (r
         });
       }
       const data = out.next;
+      const dupNum = findNewNumberDuplicate(prevNums, data);
+      if (dupNum) {
+        await client.query('ROLLBACK');
+        await audit(req.user.username, 'DOC_NUMBER_CONFLICT', 'company ' + COMPANY + ' ' + dupNum.kind + ' ' + dupNum.id + ' numri ' + dupNum.number, COMPANY).catch(() => {});
+        return res.status(409).json({
+          ok: false, conflict: 'number', kind: dupNum.kind, field: dupNum.field, id: dupNum.id, number: dupNum.number, version,
+          error: 'Numri ' + dupNum.number + ' është i zënë — pajisja e rinumeron dhe rifton',
+        });
+      }
       const vfull = validateState(data);
       if (!vfull.ok) { await client.query('ROLLBACK'); return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vfull.errors[0] }); }
       const raw = JSON.stringify(data);

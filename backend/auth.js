@@ -103,9 +103,14 @@ async function logoutToken(token) {
 
 // Rate limit i thjeshtë në memorie (për instancë të vetme — mjafton për MVP).
 const buckets = new Map();
-function rateLimit(max, windowMs) {
+// Kufizues i thjeshtë në memorie. keyFn lejon kufizim PER PËRDORUES (jo vetëm per IP),
+// sepse 20 përdorues në të njëjtën zyrë ndajnë të njëjtën IP publike: kufiri vetëm per IP
+// do t'i bllokonte ata (p.sh. i 11-ti që hyn brenda 15 minutave).
+function rateLimit(max, windowMs, keyFn) {
   return (req, res, next) => {
-    const key = (req.ip || '?') + ':' + req.path;
+    let who;
+    try { who = keyFn ? keyFn(req) : (req.ip || '?'); } catch (e) { who = req.ip || '?'; }
+    const key = who + ':' + req.path;
     const now = Date.now();
     let b = buckets.get(key);
     if (!b || b.reset < now) { b = { count: 0, reset: now + windowMs }; buckets.set(key, b); }
