@@ -10,6 +10,11 @@
     "export": "node export-backup.js",
     "test:live": "node test-live.js",
     "test:access": "node test-access-local.cjs",
+    "test:ratelimit": "node test-ratelimit-local.cjs",
+    "test:docsave": "node test-doc-save-local.cjs",
+    "test:events": "node test-events-local.cjs",
+    "test:companyrights": "node test-company-rights-local.cjs",
+    "test:realtime": "node test-realtime-load-local.cjs",
     "test:migration008": "node test-migration-008-local.cjs",
     "test:multicompany": "node test-multicompany-local.cjs",
     "test:e2e": "node test-e2e-local.cjs",
@@ -21,7 +26,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "nodemailer": "^6.10.1",
+    "nodemailer": "^10.0.10",
     "pg": "^8.12.0"
   },
   "devDependencies": {

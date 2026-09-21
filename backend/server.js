@@ -101,7 +101,9 @@ app.get('/api/health', async (req, res) => {
   res.json({ ok: true, db: await dbOk(), version: 1, syncPolicy: access.SYNC_ALL_MODULES_FOR_SERVER_USERS ? 'all-modules' : 'per-group', defaultCompany: companies.DEFAULT_COMPANY_ID, companies: companyCount, time: new Date().toISOString() });
 });
 
-app.post('/api/auth/login', rateLimit(10, 15 * 60 * 1000), needDb, async (req, res) => {
+// Login: kufi i gjerë per IP (mbrojtje nga skanimi) + kufi per PËRDORUES (10 tentativa/15 min),
+// që 20 përdorues në të njëjtën IP (zyrë/firmë) të mos bllokojnë njëri-tjetrin.
+app.post('/api/auth/login', rateLimit(60, 15 * 60 * 1000), rateLimit(10, 15 * 60 * 1000, (req) => (req.ip || '?') + ':u:' + String((req.body && req.body.username) || '').toLowerCase()), needDb, async (req, res) => {
   const { username, password } = req.body || {};
   let r;
   try { r = await loginUser(username, password); }
@@ -157,7 +159,7 @@ app.post('/api/auth/password', needDb, needAuth, async (req, res) => {
   } catch (e) { console.error('[auth:password]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.post('/api/auth/forgot', rateLimit(5, 15 * 60 * 1000), needDb, async (req, res) => {
+app.post('/api/auth/forgot', rateLimit(20, 15 * 60 * 1000), rateLimit(5, 15 * 60 * 1000, (req) => (req.ip || '?') + ':e:' + String((req.body && req.body.email) || '').toLowerCase()), needDb, async (req, res) => {
   try {
     const { isMailConfigured, sendResetCode } = require('./mailer');
     const un = String((req.body || {}).username || '').trim();
@@ -177,7 +179,7 @@ app.post('/api/auth/forgot', rateLimit(5, 15 * 60 * 1000), needDb, async (req, r
   } catch (e) { console.error('[auth:forgot]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.post('/api/auth/reset', rateLimit(10, 15 * 60 * 1000), needDb, async (req, res) => {
+app.post('/api/auth/reset', rateLimit(30, 15 * 60 * 1000), needDb, async (req, res) => {
   try {
     const { username, code, password } = req.body || {};
     if (!password || String(password).length < 8) return res.status(400).json({ ok: false, error: 'Fjalëkalimi min 8 karaktere' });
@@ -218,7 +220,7 @@ app.get('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
   } catch (e) { console.error('[state:get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.put('/api/state', needDb, needAuth, companies.needCompany(), async (req, res) => {
+app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?'), async (req, res) => {
   try {
     const { state, baseVersion, wipeAck } = req.body || {};
     const COMPANY = req.company;
