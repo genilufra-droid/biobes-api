@@ -12,6 +12,7 @@
     "test:access": "node test-access-local.cjs",
     "test:ratelimit": "node test-ratelimit-local.cjs",
     "test:docsave": "node test-doc-save-local.cjs",
+    "test:docnumbers": "node test-doc-number-local.cjs",
     "test:events": "node test-events-local.cjs",
     "test:companyrights": "node test-company-rights-local.cjs",
     "test:realtime": "node test-realtime-load-local.cjs",

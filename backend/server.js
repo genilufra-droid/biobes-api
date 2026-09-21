@@ -361,6 +361,48 @@ function applyStateOps(base, ops, allowedFields) {
   return { next, changed };
 }
 
+// --- Mbrojtja e numrave të brendshëm (F2.7) ---------------------------------
+// Numrat që sistemi i gjeneron vetë (FH-/FD- për dokumentet e magazinës, SHP- për
+// shpenzimet) llogariten në pajisje nga lista vendore; dy pajisje që krijojnë
+// dokument të të njëjtit lloj njëkohësisht mund të nxjerrin të njëjtin numër.
+// Serveri e refuzon vetëm DYFISHIMIN E RI (dokument i ri ose numër i ndryshuar) —
+// dyfishimet e vjetra në të dhëna nuk bllokojnë kurrë ruajtjen.
+const AUTO_NUMBER_KINDS = { stockDocs: 'number', expenses: 'number' };
+const AUTO_NUMBER_RE = /^[A-Z]{2,4}-\d{4}-\d{4}$/;
+function snapshotAutoNumbers(st) {
+  const out = {};
+  for (const kind of Object.keys(AUTO_NUMBER_KINDS)) {
+    const field = AUTO_NUMBER_KINDS[kind];
+    const m = new Map();
+    for (const d of (Array.isArray(st && st[kind]) ? st[kind] : [])) if (d && d.id != null) m.set(String(d.id), String(d[field] || ''));
+    out[kind] = m;
+  }
+  return out;
+}
+function findNewNumberDuplicate(prevNums, next) {
+  for (const kind of Object.keys(AUTO_NUMBER_KINDS)) {
+    const field = AUTO_NUMBER_KINDS[kind];
+    const nextList = Array.isArray(next && next[kind]) ? next[kind] : [];
+    const prevById = (prevNums && prevNums[kind]) || new Map();
+    const byNumber = new Map();
+    for (const d of nextList) {
+      if (!d || d.id == null) continue;
+      const num = String(d[field] || '');
+      if (!AUTO_NUMBER_RE.test(num)) continue;
+      if (!byNumber.has(num)) byNumber.set(num, []);
+      byNumber.get(num).push(d);
+    }
+    for (const [num, docs] of byNumber) {
+      if (docs.length < 2) continue;
+      for (const d of docs) {
+        const prevNum = prevById.get(String(d.id));
+        if (prevNum === undefined || prevNum !== num) return { kind, field, number: num, id: String(d.id) };
+      }
+    }
+  }
+  return null;
+}
+
 app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (req, res) => {
   try {
     const COMPANY = req.company;
@@ -394,6 +436,9 @@ app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (r
       // Versioni global është KËSHILLUES: ndryshimet janë incrementale (per dokument),
       // ndaj një version i vjetër nuk e humb punën e askujt. Konflikti zbulohet vetëm
       // për dokumentin e njëjtë, kur op-i sjell `prev` (shih applyStateOps).
+      // Vërejtje: applyStateOps e modifikon gjendjen NË VEND, ndaj fotografia e
+      // numrave merret përpara — përndryshe krahasimi "para/pas" nuk kap asgjë.
+      const prevNums = snapshotAutoNumbers(cur.rows[0].data);
       let out;
       try { out = applyStateOps(cur.rows[0].data, ops, allowedFields); }
       catch (e) {
@@ -403,6 +448,15 @@ app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (r
         });
       }
       const data = out.next;
+      const dupNum = findNewNumberDuplicate(prevNums, data);
+      if (dupNum) {
+        await client.query('ROLLBACK');
+        await audit(req.user.username, 'DOC_NUMBER_CONFLICT', 'company ' + COMPANY + ' ' + dupNum.kind + ' ' + dupNum.id + ' numri ' + dupNum.number, COMPANY).catch(() => {});
+        return res.status(409).json({
+          ok: false, conflict: 'number', kind: dupNum.kind, field: dupNum.field, id: dupNum.id, number: dupNum.number, version,
+          error: 'Numri ' + dupNum.number + ' është i zënë — pajisja e rinumeron dhe rifton',
+        });
+      }
       const vfull = validateState(data);
       if (!vfull.ok) { await client.query('ROLLBACK'); return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vfull.errors[0] }); }
       const raw = JSON.stringify(data);
