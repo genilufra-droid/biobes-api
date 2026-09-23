@@ -64,9 +64,14 @@ async function boot({ dbPort, apiPort, env = {} }) {
   ok('rreshti mbeti në C1', (inA.data.rows || []).length === 1 && inA.data.rows[0].company_id === 'C1');
 
   // 2) Variantet e tjera të së njëjtës fushë: ose injorohen, ose refuzohen — kurrë nuk zbatohen.
-  for (const variant of ['COMPANY_ID', 'company_Id', ' company_id', 'Company_id']) {
+  // Kujdes: kodi duhet të jetë i ndryshëm për çdo variant — që nga migrimi 010
+  // (company_id, code) është unik, ndaj kodi i përsëritur do të kthente 409 dhe
+  // prova do të kontrollonte diçka tjetër nga ç'duhet.
+  const variants = ['COMPANY_ID', 'company_Id', ' company_id', 'Company_id'];
+  for (let vi = 0; vi < variants.length; vi++) {
+    const variant = variants[vi];
     const r = await call('/api/products?company=C1', { method: 'POST', headers: H,
-      body: JSON.stringify({ code: 'X' + variant.trim().length, name: 'X', [variant]: C2 }) });
+      body: JSON.stringify({ code: 'X' + (vi + 1), name: 'X', [variant]: C2 }) });
     const okVariant = (r.status === 201 && r.data.row && r.data.row.company_id === 'C1') || r.status === 400;
     ok('POST me çelësin "' + variant + '" nuk ka efekt', okVariant, 'status ' + r.status + ' ' + JSON.stringify(r.data).slice(0, 60));
   }

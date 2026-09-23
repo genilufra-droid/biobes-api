@@ -8,6 +8,7 @@
 //  - përdoruesit e tjerë marrin vetëm ngjarjet e kompanive ku janë anëtarë;
 //  - ngjarjet globale (kompanitë, të drejtat) shkojnë te të gjithë.
 
+const bus = require('./bus');
 const clients = new Set();
 let seq = 0;
 
@@ -28,8 +29,8 @@ function send(client, event, payload) {
   }
 }
 
-// Kujt i shkon: param `company` kufizon te anëtarët e asaj kompanie (ose superuser).
-function broadcast(event, payload, opts = {}) {
+// Shpërndarje brenda kësaj instance (pa e ripublikuar në autobus).
+function broadcastLocal(event, payload, opts = {}) {
   const company = opts.company ? String(opts.company) : '';
   let n = 0;
   for (const c of [...clients]) {
@@ -38,6 +39,22 @@ function broadcast(event, payload, opts = {}) {
   }
   return n;
 }
+
+// Pika e vetme hyrëse: shpërndaje te pajisjet e kësaj instance DHE njofto
+// instancat e tjera (LISTEN/NOTIFY në Postgres) që të bëjnë të njëjtën gjë.
+// Pa këtë, me autoscale një ndryshim i bërë në instancën A nuk arrinte kurrë
+// te pajisjet që rrinë lidhur në instancën B.
+function broadcast(event, payload, opts = {}) {
+  if (bus.isEnabled()) { bus.publish(event, payload, opts).catch(() => {}); }
+  return broadcastLocal(event, payload, opts);
+}
+
+// Ngjarje të ardhura nga një instancë tjetër: shpërndahen vetëm lokalisht,
+// përndryshe do të krijohej një cikël i pafund mes instancave.
+bus.onMessage(({ event, payload, opts }) => {
+  if (!event) return;
+  broadcastLocal(event, payload, opts || {});
+});
 
 const stateChanged = (company, version, actor, extra = {}) =>
   broadcast('state-changed', { company, version, actor, at: new Date().toISOString(), ...extra }, { company });

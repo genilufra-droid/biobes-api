@@ -1,11 +1,19 @@
-# BioBes API — Web Service në Render (lidhet me Aiven Postgres).
-# KOPJOJE këtë file në RRËNJËN e repository-t GitHub (krahas folderit backend/)
-# dhe bëje deploy si Blueprint. Shih README-BACKEND.md.
+# BioBes API — infrastruktura si kod (Render Blueprint).
+#
+# Dy mjedise të njëjta, të ndara:
+#   * biobes-api-staging — ku provohet çdo ndryshim përpara prodhimit;
+#   * biobes-api         — prodhimi.
+# Të dyja lexojnë të njëjtat variabla; vetëm emrat dhe planet ndryshojnë.
+#
+# Shënim: në prodhim vendosi CORS_ORIGIN te adresa e frontend-it (jo "*").
 services:
+  # ------------------------------- PRODHIM ----------------------------------
   - type: web
     name: biobes-api
     runtime: node
     rootDir: backend
+    plan: starter
+    branch: main
     buildCommand: npm install --omit=dev
     startCommand: node server.js
     healthCheckPath: /api/health
@@ -13,19 +21,36 @@ services:
       - key: NODE_VERSION
         value: 20
       - key: DATABASE_URL
-        sync: false # Service URI e Aiven — vendoset në dashboard
+        sync: false          # Service URI e Aiven — vendoset në dashboard
       - key: ADMIN_USERNAME
         value: admin
       - key: ADMIN_PASSWORD
-        sync: false # vendoset në dashboard (Generate Value); MIN 8, rekomandohet 12+
+        sync: false          # Generate Value; 12+ karaktere
       - key: SESSION_TTL_HOURS
         value: 24
       - key: PGSSLMODE
         value: require
       - key: CORS_ORIGIN
-        value: "*"
+        sync: false          # p.sh. https://app.biobes.al
       - key: SYNC_ALL_MODULES
         value: "true"
+      # Shumë instanca: çdo ndryshim u shpërndahet të gjitha instancave me
+      # LISTEN/NOTIFY dhe kufizuesi i kërkesave numërohet një herë në databazë.
+      - key: MULTI_INSTANCE
+        value: "1"
+      - key: LOG_LEVEL
+        value: info
+      - key: POOL_MAX
+        value: "10"
+      - key: BACKUP_KEEP
+        value: "14"
+      # Vëzhgueshmëri (opsionale): Sentry ose çfarëdo webhook (Slack/Discord).
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production
+      - key: ERROR_WEBHOOK_URL
+        sync: false
       # SMTP (opsional, për rivendosjen e fjalëkalimit me email)
       - key: SMTP_HOST
         sync: false
@@ -36,4 +61,48 @@ services:
       - key: SMTP_PASS
         sync: false
       - key: SMTP_FROM
+        sync: false
+
+  # ------------------------------- STAGING ----------------------------------
+  # I njëjti kod, databazë më vete. Këtu kalojnë migrimet së pari: nëse diçka
+  # prishet, e sheh në staging dhe jo te klientët.
+  - type: web
+    name: biobes-api-staging
+    runtime: node
+    rootDir: backend
+    plan: starter
+    branch: main
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false          # databazë tjetër, jo ajo e prodhimit
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SESSION_TTL_HOURS
+        value: 24
+      - key: PGSSLMODE
+        value: require
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: SYNC_ALL_MODULES
+        value: "true"
+      - key: MULTI_INSTANCE
+        value: "0"
+      - key: LOG_LEVEL
+        value: debug
+      - key: POOL_MAX
+        value: "5"
+      - key: BACKUP_KEEP
+        value: "7"
+      - key: SENTRY_ENVIRONMENT
+        value: staging
+      - key: SENTRY_DSN
+        sync: false
+      - key: ERROR_WEBHOOK_URL
         sync: false

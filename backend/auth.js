@@ -1,22 +1,33 @@
-// BioBes API — password-e scrypt, sesione në DB, rate limit.
+// BioBes API — password-e scrypt, sesione në DB.
+// Kujdes: scrypt është i shtrenjtë me qëllim (~70 ms). Versionet e sinkronizuara
+// (crypto.scryptSync) bllokonin event loop-un e Node-it për çdo hyrje: me 20
+// përdh. njëkohësisht serveri mbetej pa përgjigje për mbi një sekondë.
+// Të dyja funksionet janë asinkrone (scrypt-i ekzekutohet në thread pool).
 const crypto = require('crypto');
+const { promisify } = require('util');
 const { getPool } = require('./db');
+
+const scryptAsync = promisify(crypto.scrypt);
 
 const SESSION_TTL_H = +(process.env.SESSION_TTL_HOURS || 24);
 
-function hashPassword(password) {
+const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64, maxmem: 64 * 1024 * 1024 };
+
+async function hashPassword(password) {
   const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(String(password), salt, 64, { N: 16384, r: 8, p: 1 });
-  return `scrypt$16384$8$1$${salt.toString('hex')}$${hash.toString('hex')}`;
+  const hash = await scryptAsync(String(password), salt, SCRYPT.keylen, SCRYPT);
+  return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString('hex')}$${hash.toString('hex')}`;
 }
 
-function verifyPassword(password, stored) {
+async function verifyPassword(password, stored) {
   try {
     const parts = String(stored).split('$');
     if (parts[0] !== 'scrypt') return false;
     const [, N, r, p, saltHex, hashHex] = parts;
-    const hash = crypto.scryptSync(String(password), Buffer.from(saltHex, 'hex'), 64, { N: +N, r: +r, p: +p });
-    return crypto.timingSafeEqual(hash, Buffer.from(hashHex, 'hex'));
+    const hash = await scryptAsync(String(password), Buffer.from(saltHex, 'hex'), 64, { N: +N, r: +r, p: +p, maxmem: SCRYPT.maxmem });
+    const expected = Buffer.from(hashHex, 'hex');
+    if (expected.length !== hash.length) return false;
+    return crypto.timingSafeEqual(hash, expected);
   } catch { return false; }
 }
 
@@ -32,7 +43,7 @@ async function ensureAdmin() {
   await p.query(
     `INSERT INTO users(id,username,name,role,password_hash,is_superadmin)
      VALUES('USR-ADMIN',$1,'Administrator','ROLE-ADMIN',$2,TRUE)`,
-    [username, hashPassword(pass)]
+    [username, await hashPassword(pass)]
   );
   // Në skemën Odoo të qasjes: admini fillestar futet edhe në grupin Administrator.
   try {
@@ -61,7 +72,7 @@ async function loginUser(username, password) {
   const p = getPool();
   const { rows } = await p.query('SELECT * FROM users WHERE username=$1 AND active=TRUE', [String(username || '').trim()]);
   const u = rows[0];
-  if (!u || !verifyPassword(password, u.password_hash)) return null;
+  if (!u || !(await verifyPassword(password, u.password_hash))) return null;
   const token = crypto.randomBytes(32).toString('hex');
   const th = crypto.createHash('sha256').update(token).digest('hex');
   await p.query('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,NOW()+($3||\' hours\')::interval)',
@@ -80,10 +91,19 @@ async function userFromToken(token) {
   const p = getPool();
   if (!p) return null;
   const th = crypto.createHash('sha256').update(String(token)).digest('hex');
-  const { rows } = await p.query(
+  const find = () => p.query(
     `SELECT u.id,u.username,u.name,u.role,u.rights,u.email,u.is_superadmin,u.active
      FROM sessions s JOIN users u ON u.id=s.user_id
      WHERE s.token_hash=$1 AND s.expires_at>NOW() AND u.active=TRUE`, [th]);
+  let { rows } = await find();
+  // Një lexim bosh për një token me format të vlefshëm është dyshim: ose sesioni
+  // s'është shkruar ende te nyja që lexojmë (replikë/failover), ose lidhja sapo
+  // është ricikluar. Pa këtë riprovë të vetme, përdoruesi del jashtë kot —
+  // ndaj e provojmë edhe një herë dhe e shënojmë në log nëse ndodh shpesh.
+  if (!rows.length && th.length === 64) {
+    ({ rows } = await find());
+    if (rows.length) console.warn('[auth] sesioni u gjet vetëm në riprovë — kontrollo shëndetin e databazës');
+  }
   return rows[0] || null;
 }
 
@@ -105,23 +125,10 @@ async function logoutToken(token) {
     [crypto.createHash('sha256').update(String(token)).digest('hex')]);
 }
 
-// Rate limit i thjeshtë në memorie (për instancë të vetme — mjafton për MVP).
-const buckets = new Map();
-// Kufizues i thjeshtë në memorie. keyFn lejon kufizim PER PËRDORUES (jo vetëm per IP),
-// sepse 20 përdorues në të njëjtën zyrë ndajnë të njëjtën IP publike: kufiri vetëm per IP
-// do t'i bllokonte ata (p.sh. i 11-ti që hyn brenda 15 minutave).
-function rateLimit(max, windowMs, keyFn) {
-  return (req, res, next) => {
-    let who;
-    try { who = keyFn ? keyFn(req) : (req.ip || '?'); } catch (e) { who = req.ip || '?'; }
-    const key = who + ':' + req.path;
-    const now = Date.now();
-    let b = buckets.get(key);
-    if (!b || b.reset < now) { b = { count: 0, reset: now + windowMs }; buckets.set(key, b); }
-    if (++b.count > max) return res.status(429).json({ ok: false, error: 'Shumë tentativa — provo pas pak minutash' });
-    next();
-  };
-}
-setInterval(() => { const now = Date.now(); for (const [k, b] of buckets) if (b.reset < now) buckets.delete(k); }, 5 * 60 * 1000).unref();
+// Kufizuesi i kërkesave jeton në ratelimit.js (kujtesë ose databazë sipas
+// MULTI_INSTANCE). Eksportohet këtu vetëm për përputhshmëri me kodin e vjetër.
+const ratelimit = require('./ratelimit');
+const rateLimit = ratelimit.rateLimit;
+// (trupi i kufizuesit u zhvendos në ratelimit.js)
 
 module.exports = { hashPassword, verifyPassword, ensureAdmin, loginUser, userFromToken, logoutToken, rateLimit, toClientUser, groupsForUser };

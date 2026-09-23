@@ -45,10 +45,14 @@ function getPool() {
     pool = new Pool({
       connectionString: sanitizedConnectionString(),
       ssl: sslConfig(),
-      max: 10,
+      max: Math.max(1, Number(process.env.POOL_MAX || 10)),
       idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
     });
     pool.on('error', (e) => console.error('[db] pool error:', e.message));
+    // Një pengesë e shkurtër e databazës nuk duhet të bllokojë kërkesat pafund:
+    // presim deri në 10 s për një lidhje, pastaj dështojmë shpejt (dhe klienti riprovojn).
+    pool.options = pool.options || {};
   }
   return pool;
 }
@@ -65,6 +69,31 @@ async function dbOk() {
   }
 }
 
+// Ekzekuton një bllok pune Brenda një transaksioni me kontekstin e kompanisë
+// të vendosur në nivel sesioni-transaksioni (set_config(..., true) = SET LOCAL).
+//
+// Kjo është çelësi i RLS-së (migrimi 010): politikat e izolimit lexojnë
+// current_setting('app.company_id'), kështu që brenda këtij blloku Postgres-i
+// refuzon vetë çdo rresht që s'i përket kompanisë — edhe sikur kodi të harrojë
+// filtrin WHERE.
+async function withCompany(companyId, fn) {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    // Kompani bosh → kontekst NULL (politikat RLS e lejojnë, si rrugët e vjetra);
+    // kompani e vendosur → vetëm rreshtat e saj kalojnë.
+    await client.query("SELECT set_config('app.company_id', $1, true)", [companyId ? String(companyId) : null]);
+    const out = await fn(client);
+    await client.query('COMMIT');
+    return out;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 // Mbyll pool-in e lidhjeve (mbyllje e butë e serverit).
 async function closePool() {
   if (!pool) return;
@@ -72,4 +101,4 @@ async function closePool() {
   pool = null;
 }
 
-module.exports = { getPool, dbOk, closePool };
+module.exports = { getPool, dbOk, closePool, withCompany };

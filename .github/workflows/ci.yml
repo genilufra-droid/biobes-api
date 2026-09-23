@@ -1,0 +1,86 @@
+# BioBes API — Integrim i vazhdueshëm.
+#
+# Dy punë:
+#  1) `provat`  — 14 suite (250+ prova) në PostgreSQL të ngulitur (PGlite);
+#  2) `postgres`— suite-a e cloud-it kundër një PostgreSQL 16 të vërtetë, me
+#                 përdorues aplikacioni JO-superuser: aty RLS-në e zbaton
+#                 vetë motori dhe LISTEN/NOTIFY provohet midis dy procesesh.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  provat:
+    name: Provat (Node 20)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Varësitë
+        working-directory: backend
+        run: npm ci || npm install
+      - name: Sintaksa e çdo file-i
+        working-directory: backend
+        run: |
+          set -e
+          for f in *.js; do node --check "$f"; done
+          for f in scripts/*.cjs; do node --check "$f"; done
+          echo "OK: sintaksë"
+      - name: Suite-at e sigurisë dhe të biznesit
+        working-directory: backend
+        run: |
+          set -e
+          total=0
+          for t in access ratelimit docsave docnumbers events companyrights realtime migration008 multicompany e2e bugs multi crudsec cloud; do
+            echo "----- $t -----"
+            out=$(npm run --silent "test:$t" 2>&1) || { echo "$out"; echo "DËSHTOI: $t"; exit 1; }
+            echo "$out" | tail -2
+          done
+          echo "Të gjitha suite-at kaluan."
+
+  postgres:
+    name: Provat kundër PostgreSQL 16 të vërtetë
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: biobes
+          POSTGRES_DB: biobes_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # JO superuser: ashtu sillet edhe avnadmin-i në Aiven, dhe vetëm kështu
+      # RLS-në e zbaton motori (superpërdoruesit e anashkalojnë çdo politikë).
+      TEST_DATABASE_URL: postgres://biobes_app:biobes_app@localhost:5432/biobes_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Roli i aplikacionit (jo-superuser)
+        run: |
+          export PGPASSWORD=biobes
+          psql -h localhost -U postgres -d biobes_test -c "CREATE ROLE biobes_app LOGIN PASSWORD 'biobes_app';"
+          psql -h localhost -U postgres -d biobes_test -c "GRANT ALL ON DATABASE biobes_test TO biobes_app;"
+          psql -h localhost -U postgres -d biobes_test -c "GRANT CREATE, USAGE ON SCHEMA public TO biobes_app;"
+      - name: Varësitë
+        working-directory: backend
+        run: npm ci || npm install
+      - name: Suite-a e cloud-it (RLS, tombstone, dy instanca, kufizues në DB)
+        working-directory: backend
+        run: npm run --silent test:cloud

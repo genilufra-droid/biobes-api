@@ -1,10 +1,13 @@
 // BioBes API — auth + sinkronizim state + multi-company CRUD + realtime SSE.
 const express = require('express');
 const crypto = require('crypto');
-const { getPool, dbOk, closePool } = require('./db');
+const { getPool, dbOk, closePool, withCompany } = require('./db');
 const { migrate } = require('./migrate');
 const { validateState } = require('./validateState');
-const { ensureAdmin, loginUser, userFromToken, logoutToken, rateLimit, verifyPassword, hashPassword, groupsForUser } = require('./auth');
+const { ensureAdmin, loginUser, userFromToken, logoutToken, verifyPassword, hashPassword, groupsForUser } = require('./auth');
+const { rateLimit, cleanup: cleanupRateBuckets, isDbBacked } = require('./ratelimit');
+const bus = require('./bus');
+const { log, requestId } = require('./log');
 const access = require('./access');
 const companies = require('./companies');
 const events = require('./events');
@@ -27,13 +30,33 @@ app.use((req, res, next) => {
   // Gjatë mbylljes së butë, kërkesat e reja refuzohen menjëherë në vend që të
   // presin dhe të dështojnë kur Render-i e mbyll procesin me forcë.
   if (shuttingDown) { res.setHeader('Connection', 'close'); return res.status(503).json({ ok: false, error: 'Serveri po mbyllet — provoni përsëri' }); }
+  // Header-a bazë sigurie (pa varësi të reja: nuk na duhet helmet për kaq).
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  // CORS: kur CORS_ORIGIN lihet "*" (parazgjedhje), e themi në log që të mos
+  // harrohet; në prodhim duhet vendosur origjina e saktë e frontend-it.
   res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,POST,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+// Një proces që vdes nga një premtim i harruar është ndërprerje e plotë për
+// të gjithë përdoruesit. I kapim, i logjojmë dhe — për gabime vërtet të
+// pakapur — mbyllim butësisht që platforma ta ngritë sërish shërbimin.
+process.on('unhandledRejection', (e) => {
+  log.error('premtim i pambikëqyrur', { err: (e && e.message) || String(e), stack: (e && e.stack || '').split('\n')[1] });
+});
+process.on('uncaughtException', (e) => {
+  log.error('gabim i pakapur — mbyllet butësisht', { err: (e && e.message) || String(e) });
+  try { server.close(() => process.exit(1)); } catch (_) { process.exit(1); }
+  setTimeout(() => process.exit(1), 3000).unref();
+});
+
 app.use(express.json({ limit: '30mb' }));
+app.use(requestId); // çdo log lidhet me një kërkesë (X-Request-Id kthehet te klienti)
 
 // Përputhshmëri me klientët e degës: header-i X-Company-Id vepron njëjtë si
 // ?company= (main e zgjedh kompaninë nga query/body përmes companies.needCompany()).
@@ -49,18 +72,19 @@ app.use((req, res, next) => {
   if (!/gzip/.test(String(req.headers['accept-encoding'] || ''))) return next();
   const json = res.json.bind(res);
   res.json = (body) => {
-    try {
-      const raw = Buffer.from(JSON.stringify(body));
-      if (raw.length > 1024) {
-        const gz = zlib.gzipSync(raw, { level: 6 });
-        res.setHeader('Content-Encoding', 'gzip');
-        res.setHeader('Vary', 'Accept-Encoding');
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.setHeader('Content-Length', gz.length);
-        return res.end(gz);
-      }
-    } catch (e) { /* në rast dështimi dërgohet e pakompresuar */ }
-    return json(body);
+    let raw;
+    try { raw = Buffer.from(JSON.stringify(body)); } catch (e) { return json(body); }
+    if (raw.length <= 1024) return json(body);
+    // zlib.gzip (asinkron) punon në thread pool: s'bllokon më event loop-un.
+    zlib.gzip(raw, { level: 6 }, (err, gz) => {
+      if (err || !gz) return json(body);
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Length', gz.length);
+      res.end(gz);
+    });
+    return res;
   };
   next();
 });
@@ -72,8 +96,20 @@ function needDb(req, res, next) {
 
 async function needAuth(req, res, next) {
   const tok = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const user = await userFromToken(tok).catch(() => null);
-  if (!user) return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
+  // Rëndësishëm: një dështim i databazës NUK duhet të duket si sesion i skaduar
+  // — më parë çdo pengesë njësekondëshe e DB-së i nxirrte përdoruesit jashtë pa
+  // arsye, edhe pse tokeni ishte plotësisht i vlefshëm. Tani dallojmë: token i
+  // pavlefshëm ose sesion vërtet i skaduar → 401, databaza poshtë → 503.
+  const looked = await userFromToken(tok).then((u) => ({ u })).catch((e) => ({ err: e }));
+  if (looked.err) {
+    log.error('auth: kërkimi i sesionit dështoi', { err: looked.err.message });
+    return res.status(503).json({ ok: false, error: 'Shërbimi nuk përgjigjet për momentin — provoni përsëri' });
+  }
+  const user = looked.u;
+  if (!user) {
+    log.warn('auth: pa sesion të vlefshëm', { path: req.originalUrl, tokLen: tok.length, tokHead: tok.slice(0, 6) });
+    return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
+  }
   req.user = user;
   // Konteksti i qasjes (modulet + superuser) sipas skemës Odoo.
   try {
@@ -118,10 +154,67 @@ async function audit(actor, action, detail, companyId) {
   } catch (e) { console.error('[audit]', e.message); }
 }
 
+// Gjendja e shërbimit: Render e godet këtë rrugë, por është edhe dritarja jonë
+// e parë kur diçka s'shkon — prandaj tregon commit-in, sa kohë ka ndezur,
+// cilat migrime janë aplikuar dhe sa lidhje SSE janë hapur.
+let migrationsApplied = [];
 app.get('/api/health', async (req, res) => {
   let companyCount = null;
   try { if (getPool()) { const r = await getPool().query('SELECT COUNT(*)::int AS c FROM companies'); companyCount = r.rows[0].c; } } catch (e) { companyCount = null; }
-  res.json({ ok: true, db: await dbOk(), version: 1, syncPolicy: access.SYNC_ALL_MODULES_FOR_SERVER_USERS ? 'all-modules' : 'per-group', defaultCompany: companies.DEFAULT_COMPANY_ID, companies: companyCount, time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    db: await dbOk(),
+    version: 2,
+    commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
+    env: process.env.NODE_ENV || 'development',
+    instanceId: process.env.INSTANCE_ID || String(process.pid),
+    uptimeSeconds: Math.round(process.uptime()),
+    memoryMb: Math.round(process.memoryUsage().rss / 1048576),
+    migrations: migrationsApplied.length,
+    syncPolicy: access.SYNC_ALL_MODULES_FOR_SERVER_USERS ? 'all-modules' : 'per-group',
+    defaultCompany: companies.DEFAULT_COMPANY_ID,
+    companies: companyCount,
+    sseClients: events.size(),
+    multiInstance: bus.isEnabled(),
+    rateLimitStore: isDbBacked() ? 'database' : 'memory',
+    time: new Date().toISOString(),
+  });
+});
+
+// Metrika për monitorim (Prometheus ose çfarëdo që lexon JSON). Vetëm admin.
+app.get('/api/metrics', needDb, needAuth, needAdminOnly, async (req, res) => {
+  const mem = process.memoryUsage();
+  const m = {
+    process_uptime_seconds: Math.round(process.uptime()),
+    process_memory_rss_bytes: mem.rss,
+    process_memory_heap_used_bytes: mem.heapUsed,
+    sse_clients: events.size(),
+    multi_instance: bus.isEnabled() ? 1 : 0,
+    server_time: new Date().toISOString(),
+  };
+  try {
+    const p = getPool();
+    const [sessions, entities, companies] = await Promise.all([
+      p.query('SELECT COUNT(*)::int AS c, COUNT(*) FILTER (WHERE expires_at > NOW())::int AS active FROM sessions'),
+      p.query(`SELECT
+                 (SELECT COUNT(*)::int FROM products) + (SELECT COUNT(*)::int FROM customers) +
+                 (SELECT COUNT(*)::int FROM suppliers) + (SELECT COUNT(*)::int FROM lots) +
+                 (SELECT COUNT(*)::int FROM weighings) + (SELECT COUNT(*)::int FROM sales_invoices) +
+                 (SELECT COUNT(*)::int FROM purchase_invoices) AS c`).catch(() => ({ rows: [{ c: null }] })),
+      p.query('SELECT COUNT(*)::int AS c FROM companies'),
+    ]);
+    m.sessions_total = sessions.rows[0].c;
+    m.sessions_active = sessions.rows[0].active;
+    m.entity_rows = entities.rows[0].c;
+    m.companies = companies.rows[0].c;
+  } catch (e) { /* metrikat e databazës janë opsionale */ }
+  if (String(req.query.format || '') === 'prometheus') {
+    res.type('text/plain').send(Object.entries(m)
+      .filter(([, v]) => typeof v === 'number')
+      .map(([k, v]) => `# HELP ${k} BioBes API\n# TYPE ${k} gauge\n${k} ${v}`).join('\n') + '\n');
+    return;
+  }
+  res.json({ ok: true, metrics: m });
 });
 
 // Login: kufi i gjerë per IP (mbrojtje nga skanimi) + kufi per PËRDORUES (10 tentativa/15 min),
@@ -174,7 +267,7 @@ app.post('/api/auth/password', needDb, needAuth, async (req, res) => {
     const p = getPool();
     const me = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const meh = crypto.createHash('sha256').update(String(me)).digest('hex');
-    await p.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hashPassword(password), req.user.id]);
+    await p.query('UPDATE users SET password_hash=$1 WHERE id=$2', [await hashPassword(password), req.user.id]);
     await p.query('DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2', [req.user.id, meh]);
     await audit(req.user.username, 'PASSWORD_CHANGE', 'Fjalëkalimi u ndryshua');
     res.json({ ok: true });
@@ -218,7 +311,7 @@ app.post('/api/auth/reset', rateLimit(30, 15 * 60 * 1000), needDb, async (req, r
       const ch = crypto.createHash('sha256').update(u.id + ':' + cd).digest('hex');
       const a = Buffer.from(ch), b = Buffer.from(r.code_hash || '');
       if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
-        await p.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hashPassword(password), u.id]);
+        await p.query('UPDATE users SET password_hash=$1 WHERE id=$2', [await hashPassword(password), u.id]);
         await p.query('DELETE FROM password_resets WHERE username=$1', [un]);
         await p.query('DELETE FROM sessions WHERE user_id=$1', [u.id]);
         await audit(u.username, 'PASSWORD_RESET', 'U rivendos me email');
@@ -551,7 +644,7 @@ app.post('/api/admin/users', needDb, needAuth, needAdminOnly, async (req, res) =
     const id = 'USR-' + crypto.randomBytes(4).toString('hex').toUpperCase();
     const p = getPool();
     await p.query('INSERT INTO users(id,username,name,role,password_hash,rights,email) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)',
-      [id, un, String(name || ''), r, hashPassword(password), (rights && typeof rights === 'object') ? JSON.stringify(rights) : null, em]);
+      [id, un, String(name || ''), r, await hashPassword(password), (rights && typeof rights === 'object') ? JSON.stringify(rights) : null, em]);
     // Anëtarësia: kompanitë e kërkuara, ose të gjitha kompanitë aktive me të parazgjedhurën (pa 'company' → sjellje e vjetër).
     try {
       const want = Array.isArray((req.body || {}).companies) && req.body.companies.length
@@ -593,7 +686,7 @@ app.patch('/api/admin/users/:id', needDb, needAuth, needAdminOnly, async (req, r
       name: name !== undefined ? String(name) : u.name,
       role: role !== undefined ? String(role) : u.role,
       active: active !== undefined ? !!active : u.active,
-      hash: password !== undefined ? hashPassword(password) : u.password_hash,
+      hash: password !== undefined ? await hashPassword(password) : u.password_hash,
     };
     const rightsJson = rights === null ? null : (rights !== undefined ? JSON.stringify(rights) : (u.rights ? JSON.stringify(u.rights) : null));
     const nem = email !== undefined ? String(email).trim() : (u.email || '');
@@ -857,7 +950,10 @@ app.post('/api/admin/wipe', rateLimit(10, 15 * 60 * 1000), needDb, async (req, r
       if (!c.rows.length) return res.status(404).json({ ok: false, error: 'Kompania nuk u gjet' });
     }
     const { rows } = await p.query('SELECT * FROM users WHERE role=\'ROLE-ADMIN\' AND active=TRUE ORDER BY created_at LIMIT 5');
-    const admin = rows.find((u) => verifyPassword(password || '', u.password_hash));
+    // Krahasimi i fjalëkalimit bëhet një nga një dhe ndalon te i pari që
+    // përputhet — pa nisur 5 scrypt paralele për çdo kërkesë.
+    let admin = null;
+    for (const u of rows) { if (await verifyPassword(String(password || ''), u.password_hash)) { admin = u; break; } }
     if (!admin) return res.status(401).json({ ok: false, error: 'Password i gabuar' });
     await p.query('DELETE FROM app_state WHERE id=$1', [company]);
     await companies.setWipeMark(p, company);
@@ -951,7 +1047,16 @@ app.delete('/api/backups/:id', needDb, needAuth, needAdminOnly, async (req, res)
 // nuk lejon header-a. Lidhja mbahet gjallë me 'ping' çdo 25 s.
 app.get('/api/events', needDb, async (req, res) => {
   const tok = String(req.query.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
-  const user = await userFromToken(tok).catch(() => null);
+  // Rëndësishëm: një dështim i databazës NUK duhet të duket si sesion i skaduar
+  // — më parë çdo pengesë njësekondëshe e DB-së i nxirrte përdoruesit jashtë pa
+  // arsye, edhe pse tokeni ishte plotësisht i vlefshëm. Tani dallojmë: token i
+  // pavlefshëm ose sesion vërtet i skaduar → 401, databaza poshtë → 503.
+  const looked = await userFromToken(tok).then((u) => ({ u })).catch((e) => ({ err: e }));
+  if (looked.err) {
+    log.error('auth: kërkimi i sesionit dështoi', { err: looked.err.message });
+    return res.status(503).json({ ok: false, error: 'Shërbimi nuk përgjigjet për momentin — provoni përsëri' });
+  }
+  const user = looked.u;
   if (!user) return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
   let superuser = true, mine = [];
   try { const a = await access.loadAccessContext(user); superuser = a.superuser !== false; } catch (e) {}
@@ -1010,8 +1115,11 @@ function needEntityAccess(field) {
 
 // Kufizues kërkesash për CRUD: 300 lexime dhe 120 shkrime për përdorues në 15
 // minuta. Pa këtë, 50 rrugët e reja ishin të pakufizuara (krahaso /api/auth/login).
-const crudReadLimit = rateLimit(300, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
-const crudWriteLimit = rateLimit(120, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+// Kufijtë mund të rregullohen pa prekur kodin (RATE_LIMIT_READ_MAX / _WRITE_MAX).
+// Në prodhim me shumë instanca, kufiri efektiv është ky numër × instancat —
+// prandaj me MULTI_INSTANCE=1 motori kalon në databazë dhe numëron një herë.
+const crudReadLimit = rateLimit(Number(process.env.RATE_LIMIT_READ_MAX || 300), 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+const crudWriteLimit = rateLimit(Number(process.env.RATE_LIMIT_WRITE_MAX || 120), 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
 
 // Gjurma e auditimit për ndryshimet e entiteteve (mungonte plotësisht).
 const crudAudit = (action, actor, company, row) =>
@@ -1040,16 +1148,23 @@ app.post('/api/admin/company/:id/wipe', needDb, needAuth, needAdminOnly, async (
     if (!c.rows.length) return res.status(404).json({ ok: false, error: 'Kompania nuk ekziston' });
     const { password } = req.body || {};
     const admins = await p.query("SELECT * FROM users WHERE role='ROLE-ADMIN' AND active=TRUE ORDER BY created_at LIMIT 5");
-    const admin = admins.rows.find((u) => verifyPassword(String(password || ''), u.password_hash));
+    let admin = null;
+    for (const u of admins.rows) { if (await verifyPassword(String(password || ''), u.password_hash)) { admin = u; break; } }
     if (!admin) return res.status(401).json({ ok: false, error: 'Password i gabuar' });
-    for (const t of ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
-                     'payments', 'customer_payments', 'sales_invoices', 'purchase_invoices']) {
-      await p.query(`DELETE FROM ${t} WHERE company_id=$1`, [cid]);
-    }
-    const w = await p.query(`INSERT INTO company_wipe_epoch(company_id,wiped_at,wiped_by)
-                             VALUES($1,NOW(),$2)
-                             ON CONFLICT(company_id) DO UPDATE SET wiped_at=NOW(), wiped_by=$2
-                             RETURNING wiped_at`, [cid, admin.username]);
+    // Një transaksion i vetëm: ose pastrohen të gjitha tabelat, ose asnjë.
+    // Më parë ishin 10 DELETE të pavarura — një dështim në mes e linte
+    // kompaninë gjysmë të pastruar, pa asnjë mënyrë ta dish.
+    const w = await withCompany(cid, async (c) => {
+      for (const t of ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
+                       'payments', 'customer_payments', 'sales_invoices', 'purchase_invoices']) {
+        await c.query(`DELETE FROM ${t} WHERE company_id=$1`, [cid]);
+      }
+      const r = await c.query(`INSERT INTO company_wipe_epoch(company_id,wiped_at,wiped_by)
+                               VALUES($1,NOW(),$2)
+                               ON CONFLICT(company_id) DO UPDATE SET wiped_at=NOW(), wiped_by=$2
+                               RETURNING wiped_at`, [cid, admin.username]);
+      return r;
+    });
     await crud.bumpVersion(cid, admin.username);
     await audit(admin.username, 'COMPANY_WIPE', 'Të dhënat relacionale të kompanisë ' + cid, cid);
     events.broadcast('company-wiped', { companyId: cid, at: new Date().toISOString(), actor: admin.username }, { company: cid });
@@ -1066,9 +1181,84 @@ app.use((err, req, res, next) => {
 });
 
 (async () => {
-  try { if (await migrate()) await ensureAdmin(); }
-  catch (e) { console.error('[boot] databaza dështoi:', e.message, '— vazhdohet pa DB.'); }
+  try {
+    if (await migrate()) {
+      await ensureAdmin();
+      try {
+        const r = await getPool().query('SELECT filename FROM schema_migrations ORDER BY filename');
+        migrationsApplied = r.rows.map((x) => x.filename);
+      } catch (e) {}
+    }
+  }
+  catch (e) { log.error('boot: databaza dështoi', { err: e.message }); }
+
+  // Shpërndarja e ngjarjeve midis instancave (MULTI_INSTANCE=1).
+  if (bus.isEnabled()) await bus.start(process.env.DATABASE_URL, undefined);
+
+  // Punë të planifikuara brenda procesit:
+  //  - sesionet e skaduara (më parë nuk pastroheshin kurrë → tabela rritej pa fund);
+  //  - kovat e kufizuesit kur motori është në databazë.
+  setInterval(async () => {
+    try {
+      const { rowCount } = await getPool().query('DELETE FROM sessions WHERE expires_at < NOW()');
+      if (rowCount) log.info('pastrim: sesione të skaduara fshirë', { count: rowCount });
+    } catch (e) { /* databaza mund të jetë poshtë */ }
+  }, 60 * 60 * 1000).unref();
+
+  setInterval(async () => {
+    const n = await cleanupRateBuckets();
+    if (n) log.info('pastrim: kova kufizuesi fshirë', { count: n });
+  }, 30 * 60 * 1000).unref();
+
+  if ((process.env.CORS_ORIGIN || '*') === '*') {
+    log.warn('CORS_ORIGIN është "*" — në prodhim vendose origjinën e frontend-it');
+  }
+  log.info('konfigurimi', {
+    multiInstance: bus.isEnabled(),
+    rateLimitStore: isDbBacked() ? 'database' : 'memory',
+    syncPolicy: access.SYNC_ALL_MODULES_FOR_SERVER_USERS ? 'all-modules' : 'per-group',
+    node: process.version,
+  });
   const server = app.listen(PORT, '0.0.0.0', () => console.log(`[biobes-api] live në portën ${PORT}`));
+
+  // ===== Eksport i plotë për rimëkëmbje (DR) — vetëm admin ====================
+  // Backup-et ekzistuese (/api/backups) ruajnë vetëm gjendjen JSON. Ky eksport
+  // përfshin edhe tabelat relacionale (produkte, klientë, fatura…) dhe
+  // përdoruesit — pa fjalëkalime — që një kopje jashtë vendit të mjaftojë për
+  // të ngritur sërish shërbimin nga zero.
+  const EXPORT_TABLES = ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
+                         'payments', 'customer_payments', 'sales_invoices', 'purchase_invoices'];
+  app.get('/api/admin/export', needDb, needAuth, needAdminOnly, async (req, res) => {
+    try {
+      const p = getPool();
+      const co = String(req.query.company || '').trim();
+      const where = (t) => (co ? ` WHERE company_id=$1` : '');
+      const args = (t) => (co ? [co] : []);
+      const out = { format: 'biobes-dr-export', version: 1, takenAt: new Date().toISOString(), company: co || null, data: {} };
+      const companies = await p.query('SELECT * FROM companies ORDER BY id');
+      out.data.companies = companies.rows;
+      for (const t of EXPORT_TABLES) {
+        try {
+          const r = await p.query(`SELECT * FROM ${t}${where(t)} ORDER BY 1`, args(t));
+          out.data[t] = r.rows;
+        } catch (e) { out.data[t] = { error: e.message }; }
+      }
+      // Gjendja JSON (dokumentet, numrat automatikë, cilësimet) për çdo kompani.
+      const st = await p.query('SELECT id AS company_id, data, version, updated_at FROM app_state');
+      out.data.app_state = st.rows;
+      // Përdoruesit pa fjalëkalime + anëtarësitë (që të rikthehen edhe të drejtat).
+      const us = await p.query('SELECT id, username, name, role, email, active, rights, is_superadmin, created_at FROM users ORDER BY created_at');
+      out.data.users = us.rows;
+      const ug = await p.query('SELECT user_id, group_id FROM user_groups');
+      out.data.user_groups = ug.rows;
+      try {
+        const uc = await p.query('SELECT user_id, company_id, is_default FROM user_companies');
+        out.data.user_companies = uc.rows;
+      } catch (e) { out.data.user_companies = []; }
+      await audit(req.user.username, 'DR_EXPORT', 'eksport i plotë' + (co ? ' / kompania ' + co : ''), co || null);
+      res.json({ ok: true, export: out });
+    } catch (e) { log.exception('dr:export', e); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+  });
 
   // ===== Mbyllja e butë =====================================================
   // Render-i dërgon SIGTERM dhe pret ~10 s. Pa këtë trajtues, çdo deploy i
@@ -1081,6 +1271,7 @@ app.use((err, req, res, next) => {
     const n = events.closeAll();
     if (n) console.log('[shutdown] ' + n + ' lidhje SSE të njoftuara.');
     server.close(async () => {
+      try { await bus.stop(); } catch (e) {}
       try { await closePool(); } catch (e) {}
       console.log('[shutdown] gati.');
       process.exit(0);
