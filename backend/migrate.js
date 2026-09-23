@@ -12,6 +12,7 @@ const MIGRATION_LOCK_KEY = 727873927; // çfarëdo numri fiks 64-bit
 
 async function migrate() {
   const p = getPool();
+  if (!p) { console.log('[db] DATABASE_URL mungon — serveri niset pa databazë (vetëm /api/health).'); return false; }
   const gate = await p.connect();
   let locked = false;
   try {

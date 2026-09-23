@@ -1057,6 +1057,104 @@ app.post('/api/admin/company/:id/wipe', needDb, needAuth, needAdminOnly, async (
   } catch (e) { console.error('[company:wipe]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
+// P3 — GET /api/manual (dhe /:moduleId) në shqip
+require('./routes/manual').register(app, { middleware: [] });
+
+// P3 — GET /api/export/xlsx
+const { buildWorkbook, XLSX_MIME } = require('./lib/xlsx');
+const MODULE_COLUMNS = {
+  products: {
+    sheetName: 'Produktet',
+    title: 'Lista e Produkteve',
+    sql: 'SELECT code, name, unit, balance FROM products WHERE company_id=$1 ORDER BY code',
+    columns: [
+      { key: 'code', header: 'KODI', width: 14 },
+      { key: 'name', header: 'EMËRTIMI', width: 32 },
+      { key: 'unit', header: 'NJËSIA', width: 10 },
+      { key: 'balance', header: 'GJENDJA', width: 14, numFmt: 165 },
+    ],
+  },
+  suppliers: {
+    sheetName: 'Furnitorët',
+    title: 'Lista e Furnitorëve',
+    sql: 'SELECT code, name, tax_id, balance FROM suppliers WHERE company_id=$1 ORDER BY code',
+    columns: [
+      { key: 'code', header: 'KODI', width: 14 },
+      { key: 'name', header: 'FURNITORI', width: 32 },
+      { key: 'tax_id', header: 'NIPT', width: 16 },
+      { key: 'balance', header: 'SALDO', width: 16, numFmt: 164 },
+    ],
+  },
+  customers: {
+    sheetName: 'Klientët',
+    title: 'Lista e Klientëve',
+    sql: 'SELECT code, name, tax_id, balance FROM customers WHERE company_id=$1 ORDER BY code',
+    columns: [
+      { key: 'code', header: 'KODI', width: 14 },
+      { key: 'name', header: 'KLIENTI', width: 32 },
+      { key: 'tax_id', header: 'NIPT', width: 16 },
+      { key: 'balance', header: 'SALDO', width: 16, numFmt: 164 },
+    ],
+  },
+  salesInvoices: {
+    sheetName: 'Faturat Shitje',
+    title: 'Faturat e Shitjes',
+    sql: `SELECT s.number, s.issued_at AS date, c.name AS customer, s.total, s.status
+          FROM sales_invoices s LEFT JOIN customers c ON c.company_id = s.company_id AND c.id = s.customer_id
+          WHERE s.company_id=$1 ORDER BY s.issued_at DESC, s.number`,
+    columns: [
+      { key: 'number', header: 'NUMRI', width: 16 },
+      { key: 'date', header: 'DATA', width: 14, numFmt: 14 },
+      { key: 'customer', header: 'KLIENTI', width: 30 },
+      { key: 'total', header: 'TOTALI', width: 16, numFmt: 164 },
+      { key: 'status', header: 'STATUSI', width: 12 },
+    ],
+  },
+  customerReturns: {
+    sheetName: 'Kthimet',
+    title: 'Kthimet e Klientëve',
+    sql: `SELECT w.id AS number, w.weighed_at AS date, c.name AS customer, w.net AS kg, w.amount AS total
+          FROM weighings w LEFT JOIN customers c ON c.company_id = w.company_id AND c.id = w.customer_id
+          WHERE w.company_id=$1 ORDER BY w.weighed_at DESC`,
+    columns: [
+      { key: 'number', header: 'NUMRI', width: 16 },
+      { key: 'date', header: 'DATA', width: 14, numFmt: 14 },
+      { key: 'customer', header: 'KLIENTI', width: 30 },
+      { key: 'kg', header: 'PESHA (KG)', width: 14, numFmt: 165 },
+      { key: 'total', header: 'VLERA', width: 16, numFmt: 164 },
+    ],
+  },
+};
+
+const sumXlsx = (rs, k) => rs.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+
+app.get('/api/export/xlsx', needDb, needAuth, companies.needCompany(), async (req, res) => {
+  const modKey = String(req.query.module || '');
+  const mod = MODULE_COLUMNS[modKey];
+  if (!mod) return res.status(404).json({ ok: false, error: 'Modul i panjohur për eksport' });
+  try {
+    const { rows } = await getPool().query(mod.sql, [req.company]);
+    const totalRow = {};
+    if (mod.columns.some((col) => col.key === 'kg')) totalRow.kg = sumXlsx(rows, 'kg');
+    if (mod.columns.some((col) => col.key === 'total')) totalRow.total = sumXlsx(rows, 'total');
+    if (mod.columns.some((col) => col.key === 'balance')) totalRow.balance = sumXlsx(rows, 'balance');
+
+    const buf = buildWorkbook({
+      title: mod.title + ' — ' + req.company,
+      sheetName: mod.sheetName,
+      columns: mod.columns,
+      rows,
+      pageSize: Number(process.env.XLSX_PAGE_SIZE || 20),
+      totalRow: Object.keys(totalRow).length ? totalRow : undefined,
+      totalLabel: 'SHUMA',
+    });
+    const fname = (modKey + '-' + new Date().toISOString().slice(0, 10) + '.xlsx');
+    res.setHeader('Content-Type', XLSX_MIME);
+    res.setHeader('Content-Disposition', 'attachment; filename="' + fname + '"');
+    res.send(buf);
+  } catch (e) { console.error('[export:xlsx]', e.message); res.status(500).json({ ok: false, error: 'Gabim gjatë eksportit' }); }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
