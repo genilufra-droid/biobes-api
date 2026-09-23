@@ -22,14 +22,18 @@ const MAX_STATE_BYTES = 25 * 1024 * 1024; // njëjtë me RESTORE_MAX_BYTES në f
 const STATE_FETCH_POLICY = 'server-authoritative';
 
 
-// CORS minimal (MVP): origjina e frontend-it ose * nëse nuk është vendosur.
+// CORS: origjina e frontend-it dhe të gjithë header-at e kërkuar (përfshirë X-Company-Id).
 app.use((req, res, next) => {
   // Gjatë mbylljes së butë, kërkesat e reja refuzohen menjëherë në vend që të
   // presin dhe të dështojnë kur Render-i e mbyll procesin me forcë.
   if (shuttingDown) { res.setHeader('Connection', 'close'); return res.status(503).json({ ok: false, error: 'Serveri po mbyllet — provoni përsëri' }); }
-  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  const origin = req.headers.origin;
+  res.setHeader('Access-Control-Allow-Origin', origin || process.env.CORS_ORIGIN || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,POST,PATCH,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  const reqHeaders = req.headers['access-control-request-headers'];
+  res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type,Authorization,X-Company-Id,X-Requested-With,Accept,Origin,If-Match');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Type,Authorization,X-Company-Id,X-State-Version,Content-Disposition');
+  res.setHeader('Access-Control-Max-Age', '600');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -72,7 +76,16 @@ function needDb(req, res, next) {
 
 async function needAuth(req, res, next) {
   const tok = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const user = await userFromToken(tok).catch(() => null);
+  let user = null;
+  if (tok.includes('.')) {
+    try {
+      const { verify } = require('./lib/token');
+      const p = verify(tok, 'access');
+      const urow = await getPool().query('SELECT id,username,name,role,rights,email,is_superadmin,active FROM users WHERE id=$1 AND active=TRUE', [p.sub]);
+      if (urow.rows.length) user = urow.rows[0];
+    } catch (_) {}
+  }
+  if (!user) user = await userFromToken(tok).catch(() => null);
   if (!user) return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
   req.user = user;
   // Konteksti i qasjes (modulet + superuser) sipas skemës Odoo.
@@ -718,8 +731,17 @@ app.patch('/api/access/users/:id/groups', needDb, needAuth, needAdminOnly, async
   } catch (e) { console.error('[access:user-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-// ===== Kompanitë (multi-company) — vetëm admin ==============================
-// Lista e kompanive me numrin e përdoruesve dhe versionin e gjendjes.
+// ===== Kompanitë (multi-company) ==========================================
+// Lista e kompanive për çdo përdorues të autentikuar.
+app.get('/api/companies', needDb, needAuth, async (req, res) => {
+  try {
+    const p = getPool();
+    const list = await companies.listCompanies(p);
+    res.json({ ok: true, companies: list, default: companies.DEFAULT_COMPANY_ID });
+  } catch (e) { console.error('[companies:list:public]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+// Lista e kompanive me numrin e përdoruesve dhe versionin e gjendjes (vetëm admin).
 app.get('/api/admin/companies', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
     const p = getPool();
@@ -877,7 +899,7 @@ app.post('/api/admin/wipe', rateLimit(10, 15 * 60 * 1000), needDb, async (req, r
 const BACKUP_KEEP = +(process.env.BACKUP_KEEP || 14);
 app.get('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
-    const co = String(req.query.company || '').trim();
+    const co = String(req.query.company || req.headers['x-company-id'] || '').trim();
     const { rows } = co
       ? await getPool().query('SELECT id,taken_at,label,taken_by,state_version,size_bytes,company_id FROM backups WHERE COALESCE(company_id,$1)=$1 ORDER BY taken_at DESC, id DESC LIMIT 50', [co])
       : await getPool().query('SELECT id,taken_at,label,taken_by,state_version,size_bytes,company_id FROM backups ORDER BY taken_at DESC, id DESC LIMIT 50');
@@ -887,7 +909,7 @@ app.get('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
 app.post('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
     const p = getPool();
-    const company = String((req.body || {}).company || '').trim() || companies.DEFAULT_COMPANY_ID;
+    const company = String((req.body || {}).company || req.query.company || req.headers['x-company-id'] || '').trim() || companies.DEFAULT_COMPANY_ID;
     const cur = await p.query('SELECT data,version FROM app_state WHERE id=$1', [company]);
     if (!cur.rows.length) return res.status(409).json({ ok: false, error: 'Serveri nuk ka ende gjendje për backup' });
     const raw = JSON.stringify(cur.rows[0].data);
