@@ -25,7 +25,7 @@ const MAX_STATE_BYTES = 25 * 1024 * 1024; // njëjtë me RESTORE_MAX_BYTES në f
 const STATE_FETCH_POLICY = 'server-authoritative';
 
 
-// CORS minimal (MVP): origjina e frontend-it ose * nëse nuk është vendosur.
+// CORS: origjina e frontend-it dhe të gjithë header-at e kërkuar (përfshirë X-Company-Id).
 app.use((req, res, next) => {
   // Gjatë mbylljes së butë, kërkesat e reja refuzohen menjëherë në vend që të
   // presin dhe të dështojnë kur Render-i e mbyll procesin me forcë.
@@ -35,11 +35,16 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
-  // CORS: kur CORS_ORIGIN lihet "*" (parazgjedhje), e themi në log që të mos
-  // harrohet; në prodhim duhet vendosur origjina e saktë e frontend-it.
-  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  // CORS: nëse CORS_ORIGIN është vendosur, ajo është e vetmja e lejuar;
+  // përndryshe pasqyrohet origjina e kërkesës (si më parë me "*", por punon
+  // edhe me kërkesa me kredenciale). Në prodhim duhet vendosur origjina e
+  // saktë e frontend-it — nëse lihet boshe, e themi në log që të mos harrohet.
+  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || req.headers.origin || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,POST,PATCH,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  const reqHeaders = req.headers['access-control-request-headers'];
+  res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type,Authorization,X-Company-Id,X-Requested-With,Accept,Origin,If-Match');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Type,Authorization,X-Company-Id,X-State-Version,Content-Disposition');
+  res.setHeader('Access-Control-Max-Age', '600');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -96,16 +101,28 @@ function needDb(req, res, next) {
 
 async function needAuth(req, res, next) {
   const tok = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  // Rëndësishëm: një dështim i databazës NUK duhet të duket si sesion i skaduar
-  // — më parë çdo pengesë njësekondëshe e DB-së i nxirrte përdoruesit jashtë pa
-  // arsye, edhe pse tokeni ishte plotësisht i vlefshëm. Tani dallojmë: token i
-  // pavlefshëm ose sesion vërtet i skaduar → 401, databaza poshtë → 503.
-  const looked = await userFromToken(tok).then((u) => ({ u })).catch((e) => ({ err: e }));
-  if (looked.err) {
-    log.error('auth: kërkimi i sesionit dështoi', { err: looked.err.message });
-    return res.status(503).json({ ok: false, error: 'Shërbimi nuk përgjigjet për momentin — provoni përsëri' });
+  // Dy mënyra hyrjeje: JWT i nënshkruar (i preferuar) ose token sesioni në DB.
+  let user = null;
+  if (tok.includes('.')) {
+    try {
+      const { verify } = require('./lib/token');
+      const p = verify(tok, 'access');
+      const urow = await getPool().query('SELECT id,username,name,role,rights,email,is_superadmin,active FROM users WHERE id=$1 AND active=TRUE', [p.sub]);
+      if (urow.rows.length) user = urow.rows[0];
+    } catch (_) { /* JWT i pavlefshëm — provohet si token sesioni */ }
   }
-  const user = looked.u;
+  if (!user) {
+    // Rëndësishëm: një dështim i databazës NUK duhet të duket si sesion i skaduar
+    // — më parë çdo pengesë njësekondëshe e DB-së i nxirrte përdoruesit jashtë pa
+    // arsye, edhe pse tokeni ishte plotësisht i vlefshëm. Tani dallojmë: token i
+    // pavlefshëm ose sesion vërtet i skaduar → 401, databaza poshtë → 503.
+    const looked = await userFromToken(tok).then((u) => ({ u })).catch((e) => ({ err: e }));
+    if (looked.err) {
+      log.error('auth: kërkimi i sesionit dështoi', { err: looked.err.message });
+      return res.status(503).json({ ok: false, error: 'Shërbimi nuk përgjigjet për momentin — provoni përsëri' });
+    }
+    user = looked.u;
+  }
   if (!user) {
     log.warn('auth: pa sesion të vlefshëm', { path: req.originalUrl, tokLen: tok.length, tokHead: tok.slice(0, 6) });
     return res.status(401).json({ ok: false, error: 'Sesioni ka skaduar — hyni përsëri' });
@@ -811,8 +828,17 @@ app.patch('/api/access/users/:id/groups', needDb, needAuth, needAdminOnly, async
   } catch (e) { console.error('[access:user-groups]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-// ===== Kompanitë (multi-company) — vetëm admin ==============================
-// Lista e kompanive me numrin e përdoruesve dhe versionin e gjendjes.
+// ===== Kompanitë (multi-company) ==========================================
+// Lista e kompanive për çdo përdorues të autentikuar.
+app.get('/api/companies', needDb, needAuth, async (req, res) => {
+  try {
+    const p = getPool();
+    const list = await companies.listCompanies(p);
+    res.json({ ok: true, companies: list, default: companies.DEFAULT_COMPANY_ID });
+  } catch (e) { console.error('[companies:list:public]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+// Lista e kompanive me numrin e përdoruesve dhe versionin e gjendjes (vetëm admin).
 app.get('/api/admin/companies', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
     const p = getPool();
@@ -973,7 +999,7 @@ app.post('/api/admin/wipe', rateLimit(10, 15 * 60 * 1000), needDb, async (req, r
 const BACKUP_KEEP = +(process.env.BACKUP_KEEP || 14);
 app.get('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
-    const co = String(req.query.company || '').trim();
+    const co = String(req.query.company || req.headers['x-company-id'] || '').trim();
     const { rows } = co
       ? await getPool().query('SELECT id,taken_at,label,taken_by,state_version,size_bytes,company_id FROM backups WHERE COALESCE(company_id,$1)=$1 ORDER BY taken_at DESC, id DESC LIMIT 50', [co])
       : await getPool().query('SELECT id,taken_at,label,taken_by,state_version,size_bytes,company_id FROM backups ORDER BY taken_at DESC, id DESC LIMIT 50');
@@ -983,7 +1009,7 @@ app.get('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
 app.post('/api/backups', needDb, needAuth, needAdminOnly, async (req, res) => {
   try {
     const p = getPool();
-    const company = String((req.body || {}).company || '').trim() || companies.DEFAULT_COMPANY_ID;
+    const company = String((req.body || {}).company || req.query.company || req.headers['x-company-id'] || '').trim() || companies.DEFAULT_COMPANY_ID;
     const cur = await p.query('SELECT data,version FROM app_state WHERE id=$1', [company]);
     if (!cur.rows.length) return res.status(409).json({ ok: false, error: 'Serveri nuk ka ende gjendje për backup' });
     const raw = JSON.stringify(cur.rows[0].data);
@@ -1039,6 +1065,36 @@ app.delete('/api/backups/:id', needDb, needAuth, needAdminOnly, async (req, res)
     res.json({ ok: true });
   } catch (e) { console.error('[backups:delete]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
+
+// Backup automatik ditor në server (mbahen 14 të fundit per kompani)
+// dhe pastrim periodik i sesioneve/token-ave të skaduar.
+async function runDailyBackups() {
+  const p = getPool();
+  if (!p) return;
+  try {
+    const list = await companies.listCompanies(p);
+    for (const c of list) {
+      if (c.active === false) continue;
+      const cur = await p.query('SELECT data,version FROM app_state WHERE id=$1', [c.id]);
+      if (!cur.rows.length || !cur.rows[0].data) continue;
+      const raw = JSON.stringify(cur.rows[0].data);
+      if (raw.length > MAX_STATE_BYTES) continue;
+      const label = 'auto-ditor-' + new Date().toISOString().slice(0, 10);
+      const exists = await p.query('SELECT 1 FROM backups WHERE COALESCE(company_id,$1)=$1 AND label=$2 LIMIT 1', [c.id, label]);
+      if (exists.rowCount) continue;
+      await p.query(
+        'INSERT INTO backups(label,taken_by,state_version,size_bytes,payload,company_id) VALUES($1,$2,$3,$4,$5::jsonb,$6)',
+        [label, 'system', cur.rows[0].version || 0, raw.length, raw, c.id]
+      );
+      await p.query('DELETE FROM backups WHERE COALESCE(company_id,$1)=$1 AND id NOT IN (SELECT id FROM backups WHERE COALESCE(company_id,$1)=$1 ORDER BY taken_at DESC, id DESC LIMIT ' + BACKUP_KEEP + ')', [c.id]);
+    }
+    await p.query('DELETE FROM sessions WHERE expires_at < NOW()').catch(() => {});
+    await p.query('DELETE FROM refresh_tokens WHERE expires_at < NOW()').catch(() => {});
+  } catch (e) { console.error('[daily-backup]', e.message); }
+}
+
+setTimeout(runDailyBackups, 60000).unref();
+setInterval(runDailyBackups, 6 * 3600 * 1000).unref();
 
 // ===== Ngjarje në kohë reale (SSE) ==========================================
 // Pajisja hap një lidhje të vetme dhe merr njoftim të menjëhershëm kur ndryshon
