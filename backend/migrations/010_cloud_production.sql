@@ -64,34 +64,7 @@ CREATE INDEX IF NOT EXISTS customer_payments_updated_idx ON customer_payments(co
 CREATE INDEX IF NOT EXISTS sales_invoices_updated_idx ON sales_invoices(company_id, updated_at);
 CREATE INDEX IF NOT EXISTS purchase_invoices_updated_idx ON purchase_invoices(company_id, updated_at);
 
--- ============ 3. RLS — IZOLIMI NË DATABAZË =================================
--- Deri tani izolimi varej vetëm nga kodi (një WHERE i harruar = të dhëna të
--- kompanisë tjetër). Me RLS, Postgres-i e refuzon vetë.
---
--- Konteksti vendoset nga aplikacioni me:
---   BEGIN; SELECT set_config('app.company_id', 'C2', true); …; COMMIT;
--- Kur konteksti nuk është vendosur (rrugë të vjetra, skripte, migrime),
--- politika lejon — kështu aktivizimi është pa rrezik dhe pa ndërprerje.
-DO $$
-DECLARE t TEXT;
-BEGIN
-  FOREACH t IN ARRAY ARRAY[
-    'products','suppliers','customers','warehouses','lots','weighings',
-    'payments','customer_payments','sales_invoices','purchase_invoices',
-    'app_state','backups'
-  ] LOOP
-    IF to_regclass(t) IS NOT NULL THEN
-      -- FORCE: politika zbatohet edhe për pronarin e tabelës (në Aiven lidhja
-      -- është pronare, përndryshe RLS do të ishte vetëm dekorative).
-      EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
-      EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
-      EXECUTE format('DROP POLICY IF EXISTS %I ON %I', t || '_company_isolation', t);
-      EXECUTE format(
-        'CREATE POLICY %I ON %I USING (current_setting(''app.company_id'', true) IS NULL OR company_id = current_setting(''app.company_id'', true)) WITH CHECK (current_setting(''app.company_id'', true) IS NULL OR company_id = current_setting(''app.company_id'', true))',
-        t || '_company_isolation', t);
-    END IF;
-  END LOOP;
-END $$;
+-- (Izolimi RLS e mbulojnë 010_rls.sql dhe 015_rls_hybrid.sql më poshtë.)
 
 -- ============ 4. KUFIZUESI I KËRKESAVE NË DATABAZË ==========================
 -- Përdoret kur MULTI_INSTANCE=1, që kufiri të jetë një për të gjitha instancat.

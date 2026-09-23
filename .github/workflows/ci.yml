@@ -39,7 +39,7 @@ jobs:
         run: |
           set -e
           total=0
-          for t in access ratelimit docsave docnumbers events companyrights realtime migration008 multicompany e2e bugs multi crudsec cloud; do
+          for t in access ratelimit docsave docnumbers events companyrights realtime migration008 multicompany e2e bugs multi crudsec kit cloud; do
             echo "----- $t -----"
             out=$(npm run --silent "test:$t" 2>&1) || { echo "$out"; echo "DËSHTOI: $t"; exit 1; }
             echo "$out" | tail -2

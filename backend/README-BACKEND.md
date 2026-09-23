@@ -281,3 +281,42 @@ aktivizon **RLS** (`ENABLE` + `FORCE`) në të gjitha tabelat me `company_id`, d
 `set_config('app.company_id', …, true)` brenda një transaksioni. Kujdes: nëse
 lidhja është superpërdorues, RLS anashkalohet — në Aiven `avnadmin` nuk është
 i tillë, ndaj politika zbatohet.
+
+
+## RLS — si funksionon në praktikë (bashkimi i dy qasjeve)
+
+Dy migrime punojnë së bashku:
+
+| Migrim | Çfarë bën |
+|---|---|
+| `010_rls.sql` | krijon funksionet e kontekstit (`app_company_id()`, `app_is_member()`, …), aktivizon `ENABLE`+`FORCE ROW LEVEL SECURITY` në çdo tabelë me `company_id` |
+| `015_rls_hybrid.sql` | bashkon dy politika konkurruese dhe shton rrugën "pa kontekst" |
+
+Politika është **hibride**, dhe kjo është e qëllim:
+
+* **kur konteksti është vendosur** (rruga e CRUD-it, `db.withCompany` →
+  `lib/pgCompany.js`): shihen vetëm rreshtat e kompanisë aktive **dhe** vetëm
+  përdoruesit që janë anëtarë të saj; superadmini kalon. Një `UPDATE`/`DELETE`
+  mbi rreshtin e kompanisë tjetër prek **0 rreshta**, një `INSERT` në kompaninë
+  tjetër refuzohet nga vetë Postgres-i.
+* **kur konteksti nuk është vendosur**: lejohet — sepëse shërbimi ka dhjetëra
+  rrugë që pyesin drejtpërdrejt (`/api/auth/login` lexon `users`, lista e
+  kompanive lexon `companies`, anëtarësia lexon `user_companies`). Pa këtë rrugë,
+  **asnjë nuk do të hynte** — testet lokale nuk e kapin sepse PGlite lidhet si
+  superuser dhe RLS anashkalohet; në Aiven (`avnadmin`, jo-superuser) dështimi
+  do të shfaqej vetëm në prodhim.
+
+Dy detaje që ngarkohen lehtë:
+
+1. **`user_companies` mbetet pa RLS.** Ajo lexohet *brenda* politikave
+   (`app_is_member` → `company_users` → `user_companies`); po t'i vendoset RLS,
+   politikat kërkojnë vetë vetën dhe Postgres-i hedh gabim rekursioni. Nuk
+   përmban të dhëna biznesi, vetëm çiftet (kompani, përdorues).
+2. **`company_users` është një *view*** mbi `user_companies`. I gjithë kodi i
+   aplikacionit përdor `user_companies`; view-i e mban të njëjtin burim të
+   së vërtetës, që të mos shmangen dy tabela.
+
+Në prodhim cakto `APP_DB_ROLE=biobes_app` (e krijon migrimi `014_app_role.sql`):
+Postgres-i **nuk zbaton RLS për superuser**, madje as me `FORCE`. Me
+`SET LOCAL ROLE` (e bën automatikisht `lib/pgCompany.js`) çdo transaksion
+ekzekutohet me një rol jo-superuser, kështu që politikat vlejnë vërtet.

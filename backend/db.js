@@ -70,28 +70,21 @@ async function dbOk() {
 }
 
 // Ekzekuton një bllok pune Brenda një transaksioni me kontekstin e kompanisë
-// të vendosur në nivel sesioni-transaksioni (set_config(..., true) = SET LOCAL).
+// të vendosur në nivel sesioni-transaksioni.
 //
-// Kjo është çelësi i RLS-së (migrimi 010): politikat e izolimit lexojnë
-// current_setting('app.company_id'), kështu që brenda këtij blloku Postgres-i
-// refuzon vetë çdo rresht që s'i përket kompanisë — edhe sikur kodi të harrojë
-// filtrin WHERE.
-async function withCompany(companyId, fn) {
-  const client = await getPool().connect();
-  try {
-    await client.query('BEGIN');
-    // Kompani bosh → kontekst NULL (politikat RLS e lejojnë, si rrugët e vjetra);
-    // kompani e vendosur → vetëm rreshtat e saj kalojnë.
-    await client.query("SELECT set_config('app.company_id', $1, true)", [companyId ? String(companyId) : null]);
-    const out = await fn(client);
-    await client.query('COMMIT');
-    return out;
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
-    throw e;
-  } finally {
-    client.release();
-  }
+// Ky funksion është pika e vetme e kontekstit për të gjithë kodin e CRUD-it.
+// Të dyja shenjat pranohen:
+//   withCompany('C1', fn)                                  — vetëm kompania
+//   withCompany({ companyId, userId, isSuperadmin }, fn)   — kontekst i plotë
+// dhe delegon në lib/pgCompany.js, i cili veç kompanisë vendos edhe
+// `app.user_id`, `app.is_superadmin` dhe `SET LOCAL ROLE` kur është caktuar
+// APP_DB_ROLE — pa këto, politikat RLS (010_rls + 015) nuk e njohin përdoruesin.
+async function withCompany(companyOrCtx, fn) {
+  const pg = require('./lib/pgCompany');
+  const ctx = (companyOrCtx && typeof companyOrCtx === 'object')
+    ? companyOrCtx
+    : { companyId: companyOrCtx };
+  return pg.withCompany(ctx, fn);
 }
 
 // Mbyll pool-in e lidhjeve (mbyllje e butë e serverit).

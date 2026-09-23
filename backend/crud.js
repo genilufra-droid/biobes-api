@@ -14,6 +14,13 @@ const { getPool, withCompany } = require('./db');
 const { log } = require('./log');
 
 const COMPANY = (req) => req.company || req.companyId || '';
+// Konteksti i plotë për RLS-në (010_rls + 015): pa userId, politikat e anëtarësisë
+// nuk njohin përdoruesin dhe CRUD-i do të kthente zero rreshta.
+const CTX = (req) => ({
+  companyId: COMPANY(req),
+  userId: (req.user && req.user.id) || '',
+  isSuperadmin: !!(req.user && (req.user.is_superadmin || req.user.role === 'ROLE-ADMIN')),
+});
 
 // Fushat që klienti nuk i vendos kurrë. Krahasimi bëhet me shkronja të vogla,
 // sepse Postgres i palos identifikuesit e pa-cituar ('Company_ID' = company_id).
@@ -113,7 +120,7 @@ function buildCrud(table, opts = {}) {
           where += ' AND (' + conds.join(' OR ') + ')';
           cols.forEach(() => params.push('%' + q + '%'));
         }
-        const out = await withCompany(COMPANY(req), async (c) => {
+        const out = await withCompany(CTX(req), async (c) => {
           const { rows } = await c.query(
             `SELECT * FROM ${table} ${where} ORDER BY ${defaultSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
             [...params, limit, offset]
@@ -130,7 +137,7 @@ function buildCrud(table, opts = {}) {
 
     get: guarded(async (req, res) => {
       try {
-        const out = await withCompany(COMPANY(req), async (c) => {
+        const out = await withCompany(CTX(req), async (c) => {
           const { rows } = await c.query(
             `SELECT * FROM ${table} WHERE company_id=$1 AND id=$2 AND deleted_at IS NULL`, [COMPANY(req), req.params.id]);
           return rows[0] || null;
@@ -152,7 +159,7 @@ function buildCrud(table, opts = {}) {
         const cols = ['company_id', 'id', ...keys, 'version', 'updated_at'];
         const vals = [COMPANY(req), String(id), ...keys.map((k) => f.data[k])];
         const ph = cols.map((c, i) => (c === 'updated_at' ? 'NOW()' : c === 'version' ? '1' : '$' + (i + 1)));
-        const out = await withCompany(COMPANY(req), async (c) => {
+        const out = await withCompany(CTX(req), async (c) => {
           const { rows } = await c.query(
             `INSERT INTO ${table} (${cols.join(',')}) VALUES (${ph.join(',')}) RETURNING *`, vals);
           return rows[0];
@@ -179,7 +186,7 @@ function buildCrud(table, opts = {}) {
         // refuzohet me 409 kur dikush tjetër e ka ndryshuar që më parë.
         const want = Number(req.headers['if-match'] || (req.body || {}).baseVersion);
         const set = keys.map((k, i) => `${k} = $${i + 3}`).concat(['version = version + 1', 'updated_at = NOW()']);
-        const out = await withCompany(COMPANY(req), async (c) => {
+        const out = await withCompany(CTX(req), async (c) => {
           const cur = await c.query(`SELECT version FROM ${table} WHERE company_id=$1 AND id=$2 AND deleted_at IS NULL`, [COMPANY(req), req.params.id]);
           if (!cur.rows.length) return null;
           if (Number.isFinite(want) && want > 0 && Number(cur.rows[0].version) !== want) return { conflict: cur.rows[0].version };
@@ -208,7 +215,7 @@ function buildCrud(table, opts = {}) {
     remove: guarded(async (req, res) => {
       try {
         const hard = String(req.query.hard || '') === '1' && req.user && req.user.role === 'ROLE-ADMIN';
-        const out = await withCompany(COMPANY(req), async (c) => {
+        const out = await withCompany(CTX(req), async (c) => {
           if (hard) {
             const r = await c.query(`DELETE FROM ${table} WHERE company_id=$1 AND id=$2 RETURNING id`, [COMPANY(req), req.params.id]);
             return r.rows[0] || null;

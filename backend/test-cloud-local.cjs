@@ -104,16 +104,47 @@ function sse(url) {
     }
     const open = await db.query('SELECT id FROM products ORDER BY id');
     ok('RLS: pa kontekst, rrugët e vjetra punojnë', open.rows.length === 2, 'rreshta=' + open.rows.length);
+    // Konteksti i plotë, siç e vendos aplikacioni (db.withCompany):
+    // kompania + përdoruesi + superadmin. Pa userId, politika e anëtarësisë
+    // nuk e njoh përdoruesin — dhe kjo është pikë e dobët e mbrojtjes:
+    // një kontekst i vendosur pa përdorues nuk duhet të shfaqë asgjë.
+    await db.query("INSERT INTO users(id, username, name, role, password_hash, active) VALUES ('U-ANETAR','anetar','Anetar','ROLE-USER','x',TRUE) ON CONFLICT DO NOTHING");
+    await db.query("INSERT INTO user_companies(user_id,company_id,is_default) VALUES ('U-ANETAR','C1',TRUE) ON CONFLICT DO NOTHING");
     await db.query('BEGIN');
-    await db.query("SELECT set_config('app.company_id','C1',true)");
+    await db.query("SELECT set_config('app.company_id','C1',true), set_config('app.user_id','U-ANETAR',true), set_config('app.is_superadmin','off',true)");
     const scoped = await db.query('SELECT id, company_id FROM products ORDER BY id');
-    ok('RLS: me kontekst C1 shihet vetëm C1', scoped.rows.length === 1 && scoped.rows[0].company_id === 'C1', JSON.stringify(scoped.rows));
+    ok('RLS: anëtari i C1 shihet vetëm C1', scoped.rows.length === 1 && scoped.rows[0].company_id === 'C1', JSON.stringify(scoped.rows));
+    await db.query('ROLLBACK');
+    // Superadmini sheh të dyja (rrugët administrative: listime, backup).
+    await db.query('BEGIN');
+    await db.query("SELECT set_config('app.company_id','',true), set_config('app.user_id','',true), set_config('app.is_superadmin','on',true)");
+    const all = await db.query('SELECT id, company_id FROM products ORDER BY id');
+    ok('RLS: konteksti i sistemit sheh të gjitha', all.rows.length === 2, 'rreshta=' + all.rows.length);
+    await db.query('ROLLBACK');
+    // Një kontekst pa përdorues nuk duhet të nxjerë asgjë (mbrojtje nga kontekste të përgjithshme).
+    await db.query('BEGIN');
+    await db.query("SELECT set_config('app.company_id','C1',true), set_config('app.user_id','',true), set_config('app.is_superadmin','off',true)");
+    const anon = await db.query('SELECT id FROM products');
+    ok('RLS: kontekst kompanie pa përdorues nuk shfaq rreshta', anon.rows.length === 0, 'rreshta=' + anon.rows.length);
+    await db.query('ROLLBACK');
+    // Të njëjtat tentativa të shkrimit, por me kontekstin e një ANËTARI të C1:
+    // ky është sulmi që mban izolimin — edhe një përdorues i ligjshëm i C1
+    // nuk mund të prekë rreshtin e C2, edhe po të dijë ID-në e tij.
+    await db.query('BEGIN');
+    await db.query("SELECT set_config('app.company_id','C1',true), set_config('app.user_id','U-ANETAR',true), set_config('app.is_superadmin','off',true)");
     const upd = await db.query("UPDATE products SET price=999 WHERE id='P2' RETURNING id");
     ok('RLS: UPDATE mbi rreshtin e C2 bllokohet', upd.rows.length === 0, 'rreshta=' + upd.rows.length);
     const del = await db.query("DELETE FROM products WHERE id='P2' RETURNING id");
     ok('RLS: DELETE mbi rreshtin e C2 bllokohet', del.rows.length === 0);
+    // Një shkelje e politikes e ndërpret transaksionin, ndaj tentativa vihet
+    // brenda një SAVEPOINT — kështu vazhdojmë të provojmë edhe rreshtin e vet.
+    await db.query('SAVEPOINT tentativa');
     const ins = await db.query("INSERT INTO products(company_id,id,code,name) VALUES ('C2','P3','P3','Infiltrim') RETURNING id").catch((e) => ({ err: e.message }));
     ok('RLS: INSERT në C2 me kontekst C1 bllokohet', !!ins.err, (ins.err || '').slice(0, 60));
+    await db.query('ROLLBACK TO SAVEPOINT tentativa');
+    // …por rreshti i vet i C1 është i shkrueshëm (izolimi s'duhet të bllokojë punën e ligjshme).
+    const own = await db.query("UPDATE products SET price=123 WHERE id='P1' RETURNING price");
+    ok('RLS: rreshti i kompanisë së vet mbahet i shkrueshëm', own.rows.length === 1, 'rreshta=' + own.rows.length);
     await db.query('ROLLBACK');
     await db.query('RESET ROLE');
   }

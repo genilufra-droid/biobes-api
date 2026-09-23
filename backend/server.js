@@ -1248,7 +1248,11 @@ app.get('/api/export/xlsx', needDb, needAuth, companies.needCompany(), async (re
   const mod = MODULE_COLUMNS[modKey];
   if (!mod) return res.status(404).json({ ok: false, error: 'Modul i panjohur për eksport' });
   try {
-    const { rows } = await getPool().query(mod.sql, [req.company]);
+    // Brenda kontekstit të kompanisë: me RLS të detyrueshëm (010_rls + 015), një
+    // pyetje pa kontekst do të kthente zero rreshta dhe eksporti do të dilte bosh.
+    const { rows } = await withCompany({ companyId: req.company, userId: (req.user && req.user.id) || '',
+                                         isSuperadmin: !!(req.user && (req.user.is_superadmin || req.user.role === 'ROLE-ADMIN')) },
+                                       (c) => c.query(mod.sql, [req.company]));
     const totalRow = {};
     if (mod.columns.some((col) => col.key === 'kg')) totalRow.kg = sumXlsx(rows, 'kg');
     if (mod.columns.some((col) => col.key === 'total')) totalRow.total = sumXlsx(rows, 'total');
@@ -1269,6 +1273,45 @@ app.get('/api/export/xlsx', needDb, needAuth, companies.needCompany(), async (re
     res.send(buf);
   } catch (e) { console.error('[export:xlsx]', e.message); res.status(500).json({ ok: false, error: 'Gabim gjatë eksportit' }); }
 });
+
+  // ===== Eksport i plotë për rimëkëmbje (DR) — vetëm admin ====================
+  // Backup-et ekzistuese (/api/backups) ruajnë vetëm gjendjen JSON. Ky eksport
+  // përfshin edhe tabelat relacionale (produkte, klientë, fatura…) dhe
+  // përdoruesit — pa fjalëkalime — që një kopje jashtë vendit të mjaftojë për
+  // të ngritur sërish shërbimin nga zero.
+  const EXPORT_TABLES = ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
+                         'payments', 'customer_payments', 'sales_invoices', 'purchase_invoices'];
+  app.get('/api/admin/export', needDb, needAuth, needAdminOnly, async (req, res) => {
+    try {
+      const p = getPool();
+      const co = String(req.query.company || '').trim();
+      const where = (t) => (co ? ` WHERE company_id=$1` : '');
+      const args = (t) => (co ? [co] : []);
+      const out = { format: 'biobes-dr-export', version: 1, takenAt: new Date().toISOString(), company: co || null, data: {} };
+      const companies = await p.query('SELECT * FROM companies ORDER BY id');
+      out.data.companies = companies.rows;
+      for (const t of EXPORT_TABLES) {
+        try {
+          const r = await p.query(`SELECT * FROM ${t}${where(t)} ORDER BY 1`, args(t));
+          out.data[t] = r.rows;
+        } catch (e) { out.data[t] = { error: e.message }; }
+      }
+      // Gjendja JSON (dokumentet, numrat automatikë, cilësimet) për çdo kompani.
+      const st = await p.query('SELECT id AS company_id, data, version, updated_at FROM app_state');
+      out.data.app_state = st.rows;
+      // Përdoruesit pa fjalëkalime + anëtarësitë (që të rikthehen edhe të drejtat).
+      const us = await p.query('SELECT id, username, name, role, email, active, rights, is_superadmin, created_at FROM users ORDER BY created_at');
+      out.data.users = us.rows;
+      const ug = await p.query('SELECT user_id, group_id FROM user_groups');
+      out.data.user_groups = ug.rows;
+      try {
+        const uc = await p.query('SELECT user_id, company_id, is_default FROM user_companies');
+        out.data.user_companies = uc.rows;
+      } catch (e) { out.data.user_companies = []; }
+      await audit(req.user.username, 'DR_EXPORT', 'eksport i plotë' + (co ? ' / kompania ' + co : ''), co || null);
+      res.json({ ok: true, export: out });
+    } catch (e) { log.exception('dr:export', e); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+  });
 
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars
@@ -1318,45 +1361,6 @@ app.use((err, req, res, next) => {
     node: process.version,
   });
   const server = app.listen(PORT, '0.0.0.0', () => console.log(`[biobes-api] live në portën ${PORT}`));
-
-  // ===== Eksport i plotë për rimëkëmbje (DR) — vetëm admin ====================
-  // Backup-et ekzistuese (/api/backups) ruajnë vetëm gjendjen JSON. Ky eksport
-  // përfshin edhe tabelat relacionale (produkte, klientë, fatura…) dhe
-  // përdoruesit — pa fjalëkalime — që një kopje jashtë vendit të mjaftojë për
-  // të ngritur sërish shërbimin nga zero.
-  const EXPORT_TABLES = ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
-                         'payments', 'customer_payments', 'sales_invoices', 'purchase_invoices'];
-  app.get('/api/admin/export', needDb, needAuth, needAdminOnly, async (req, res) => {
-    try {
-      const p = getPool();
-      const co = String(req.query.company || '').trim();
-      const where = (t) => (co ? ` WHERE company_id=$1` : '');
-      const args = (t) => (co ? [co] : []);
-      const out = { format: 'biobes-dr-export', version: 1, takenAt: new Date().toISOString(), company: co || null, data: {} };
-      const companies = await p.query('SELECT * FROM companies ORDER BY id');
-      out.data.companies = companies.rows;
-      for (const t of EXPORT_TABLES) {
-        try {
-          const r = await p.query(`SELECT * FROM ${t}${where(t)} ORDER BY 1`, args(t));
-          out.data[t] = r.rows;
-        } catch (e) { out.data[t] = { error: e.message }; }
-      }
-      // Gjendja JSON (dokumentet, numrat automatikë, cilësimet) për çdo kompani.
-      const st = await p.query('SELECT id AS company_id, data, version, updated_at FROM app_state');
-      out.data.app_state = st.rows;
-      // Përdoruesit pa fjalëkalime + anëtarësitë (që të rikthehen edhe të drejtat).
-      const us = await p.query('SELECT id, username, name, role, email, active, rights, is_superadmin, created_at FROM users ORDER BY created_at');
-      out.data.users = us.rows;
-      const ug = await p.query('SELECT user_id, group_id FROM user_groups');
-      out.data.user_groups = ug.rows;
-      try {
-        const uc = await p.query('SELECT user_id, company_id, is_default FROM user_companies');
-        out.data.user_companies = uc.rows;
-      } catch (e) { out.data.user_companies = []; }
-      await audit(req.user.username, 'DR_EXPORT', 'eksport i plotë' + (co ? ' / kompania ' + co : ''), co || null);
-      res.json({ ok: true, export: out });
-    } catch (e) { log.exception('dr:export', e); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
-  });
 
   // ===== Mbyllja e butë =====================================================
   // Render-i dërgon SIGTERM dhe pret ~10 s. Pa këtë trajtues, çdo deploy i
