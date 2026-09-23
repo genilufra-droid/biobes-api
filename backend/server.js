@@ -1256,6 +1256,39 @@ app.post('/api/attachments', needDb, needAuth, companies.needCompany(), express.
   }
 });
 
+// ===== Fiscalization API (Ligji Nr. 87/2019 DPT / CIS) =======================
+const fiscal = require('./fiscalization');
+
+app.get('/api/fiscalization/config', needAuth, async (req, res) => {
+  try {
+    res.json({ ok: true, config: fiscal.DEFAULT_CONFIG, endpoints: fiscal.ENDPOINTS });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/fiscalization/ping', async (req, res) => {
+  try {
+    const env = (req.body && req.body.env) || 'prod';
+    const result = await fiscal.pingDPT(env);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/fiscalization/register-invoice', needAuth, async (req, res) => {
+  try {
+    const { invoice, config } = req.body || {};
+    if (!invoice) return res.status(400).json({ ok: false, error: 'Mungojnë të dhënat e faturës' });
+    const result = await fiscal.registerInvoice(invoice, config);
+    res.json(result);
+  } catch (e) {
+    console.error('[fiscalization:register]', e.message);
+    res.status(500).json({ ok: false, error: 'Gabim gjatë fiskalizimit: ' + e.message });
+  }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
