@@ -1,6 +1,7 @@
 // BioBes API — auth + sinkronizim state + multi-company CRUD + realtime SSE.
 const express = require('express');
 const crypto = require('crypto');
+const { syncStateToRelational } = require('./lib/relationalSync');
 const { getPool, dbOk, closePool } = require('./db');
 const { migrate } = require('./migrate');
 const { validateState } = require('./validateState');
@@ -317,6 +318,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(+(pro
       await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version ' + ver + ' (blind)' + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')), COMPANY);
       await clearWipeMark();
       events.stateChanged(COMPANY, ver, req.user.username);
+      syncStateToRelational(p, COMPANY, stateToStore).catch((e) => console.error('[relationalSync]', e.message));
       return res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString(), mergedFromServer });
     }
     if (!Number.isFinite(+baseVersion)) {
@@ -341,6 +343,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(+(pro
           await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version 1 (init)', COMPANY);
           await clearWipeMark();
           events.stateChanged(COMPANY, 1, req.user.username);
+          syncStateToRelational(p, COMPANY, stateToStore).catch((e) => console.error('[relationalSync]', e.message));
           return res.json({ ok: true, version: 1, company: COMPANY, updatedAt: new Date().toISOString(), mergedFromServer });
         }
       }
@@ -352,6 +355,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(+(pro
     await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version ' + ver + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')), COMPANY);
     await clearWipeMark();
     events.stateChanged(COMPANY, ver, req.user.username);
+    syncStateToRelational(p, COMPANY, stateToStore).catch((e) => console.error('[relationalSync]', e.message));
     res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString(), mergedFromServer });
   } catch (e) { console.error('[state:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
@@ -517,6 +521,7 @@ app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (r
       await audit(req.user.username, 'STATE_PATCH', 'company ' + COMPANY + ' version ' + ver + ' / ' + out.changed + ' ndryshime / ' + kinds, COMPANY);
       await companies.clearWipeMark(p, COMPANY).catch(() => {});
       events.stateChanged(COMPANY, ver, req.user.username, { patch: true, ops: out.changed, kinds });
+      syncStateToRelational(p, COMPANY, data).catch((e) => console.error('[relationalSync:patch]', e.message));
       return res.json({ ok: true, version: ver, company: COMPANY, applied: out.changed, kinds });
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch (_e) {}
@@ -1207,6 +1212,47 @@ app.get('/api/export/xlsx', needDb, needAuth, companies.needCompany(), async (re
   } catch (e) { console.error('[export:xlsx]', e.message); res.status(500).json({ ok: false, error: 'Gabim gjatë eksportit' }); }
 });
 
+// ===== Attachments API (Faza Enterprise Cloud) ==============================
+// Shërben dhe ruan skedarë binarë (foto peshimi, fatura, PDF) jashtë app_state JSON.
+app.get('/api/attachments/:id', needDb, async (req, res) => {
+  try {
+    const p = getPool();
+    const { rows } = await p.query('SELECT filename, mime_type, data, size_bytes FROM attachments WHERE id=$1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Skedari nuk u gjet' });
+    const att = rows[0];
+    res.setHeader('Content-Type', att.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Length', att.size_bytes || att.data.length);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Content-Disposition', 'inline; filename="' + encodeURIComponent(att.filename) + '"');
+    res.send(att.data);
+  } catch (e) {
+    console.error('[attachments:get]', e.message);
+    res.status(500).json({ ok: false, error: 'Gabim serveri' });
+  }
+});
+
+app.post('/api/attachments', needDb, needAuth, companies.needCompany(), express.raw({ type: '*/*', limit: '15mb' }), async (req, res) => {
+  try {
+    const p = getPool();
+    const company = req.company;
+    const filename = String(req.headers['x-filename'] || req.query.filename || 'skedar').slice(0, 150);
+    const mime = String(req.headers['content-type'] || 'application/octet-stream').slice(0, 100);
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || !buf.length) {
+      return res.status(400).json({ ok: false, error: 'Skedari është bosh' });
+    }
+    const id = 'ATT-' + Date.now().toString(36).toUpperCase() + '-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+    await p.query(
+      'INSERT INTO attachments(company_id, id, filename, mime_type, size_bytes, data, created_at) VALUES($1,$2,$3,$4,$5,$6,NOW())',
+      [company, id, filename, mime, buf.length, buf]
+    );
+    res.status(201).json({ ok: true, id, filename, url: '/api/attachments/' + id, sizeBytes: buf.length });
+  } catch (e) {
+    console.error('[attachments:upload]', e.message);
+    res.status(500).json({ ok: false, error: 'Gabim gjatë ngarkimit' });
+  }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
@@ -1216,8 +1262,18 @@ app.use((err, req, res, next) => {
 });
 
 (async () => {
-  try { if (await migrate()) await ensureAdmin(); }
-  catch (e) { console.error('[boot] databaza dështoi:', e.message, '— vazhdohet pa DB.'); }
+  try {
+    if (await migrate()) {
+      await ensureAdmin();
+      const p = getPool();
+      if (p) {
+        const { rows } = await p.query('SELECT id, data FROM app_state WHERE data IS NOT NULL');
+        for (const r of rows) {
+          syncStateToRelational(p, r.id, r.data).catch((e) => console.warn('[boot:sync]', r.id, e.message));
+        }
+      }
+    }
+  } catch (e) { console.error('[boot] databaza dështoi:', e.message, '— vazhdohet pa DB.'); }
   const server = app.listen(PORT, '0.0.0.0', () => console.log(`[biobes-api] live në portën ${PORT}`));
 
   // ===== Mbyllja e butë =====================================================
