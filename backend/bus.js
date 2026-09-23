@@ -29,8 +29,15 @@ const enabled = String(process.env.MULTI_INSTANCE || '').toLowerCase() === '1'
 let client = null;
 let stopping = false;
 const handlers = new Set();
+// Numëra për vëzhgueshmëri: me shumë instanca, "ngjarja nuk mbërriti" është
+// gabimi më i rëndë dhe më i padukshëm — këto numra e tregojnë nëse dështoi
+// dërgimi, marrja apo shpërndarja lokale.
+const counters = { published: 0, received: 0, ownFiltered: 0, errors: 0, lastError: null };
 
 function isEnabled() { return enabled; }
+function isConnected() { return !!client; }
+// Numërat e autobusit (për /api/health dhe diagnostikim).
+function stats() { return { ...counters, connected: !!client }; }
 
 // Parametri i tretë është derë prove: suite-ja lokale fut një klient të sajuar,
 // sepse serveri i socket-it të PGlite-it nuk ua përcjell njoftimet NOTIFY
@@ -83,4 +90,4 @@ async function stop() {
   client = null;
 }
 
-module.exports = { start, stop, publish, onMessage, isEnabled, CHANNEL, myId: () => MY_ID };
+module.exports = { start, stop, publish, onMessage, isEnabled, isConnected, stats, CHANNEL, myId: () => MY_ID };

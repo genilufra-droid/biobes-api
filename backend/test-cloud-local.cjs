@@ -297,9 +297,12 @@ function sse(url) {
       const st = { products: [{ id: 'P1', code: 'P1', name: 'Molle' }], suppliers: [], customers: [], warehouses: [], lots: [], settings: {} };
       const put = await A.call('/api/state', { method: 'PUT', headers: HA, body: JSON.stringify({ state: st }) });
       await sleep(2500);
-      ok('dy instanca: ndryshimi në A arrin te pajisja lidhur në B',
-         client.events.some((e) => e.event === 'state-changed'),
-         'put=' + put.status + ' evente=' + client.events.map((e) => e.event).join(','));
+      const got = client.events.some((e) => e.event === 'state-changed');
+      const hA = await A.call('/api/health');
+      const hB = await B.call('/api/health');
+      ok('dy instanca: ndryshimi në A arrin te pajisja lidhur në B', got,
+         'put=' + put.status + ' evente=' + client.events.map((e) => e.event).join(',')
+         + ' | A.bus=' + JSON.stringify(hA.data.bus) + ' | B.bus=' + JSON.stringify(hB.data.bus));
     }
 
     // Kufizuesi në databazë: një kovë e përbashkët për të gjitha instancat.

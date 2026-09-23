@@ -193,6 +193,7 @@ app.get('/api/health', async (req, res) => {
     companies: companyCount,
     sseClients: events.size(),
     multiInstance: bus.isEnabled(),
+    bus: bus.isEnabled() ? { channel: bus.CHANNEL, connected: bus.isConnected(), ...bus.stats() } : null,
     rateLimitStore: isDbBacked() ? 'database' : 'memory',
     time: new Date().toISOString(),
   });
@@ -1412,6 +1413,7 @@ app.use((err, req, res, next) => {
   }
   log.info('konfigurimi', {
     multiInstance: bus.isEnabled(),
+    bus: bus.isEnabled() ? { channel: bus.CHANNEL, connected: bus.isConnected(), ...bus.stats() } : null,
     rateLimitStore: isDbBacked() ? 'database' : 'memory',
     syncPolicy: access.SYNC_ALL_MODULES_FOR_SERVER_USERS ? 'all-modules' : 'per-group',
     node: process.version,
