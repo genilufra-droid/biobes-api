@@ -1277,6 +1277,18 @@ app.post('/api/fiscalization/ping', async (req, res) => {
   }
 });
 
+
+app.post('/api/fiscalization/register-wtn', needAuth, async (req, res) => {
+  try {
+    const { wtnDoc, config } = req.body || {};
+    const result = await fiscal.registerWTN(wtnDoc || {}, config || {});
+    res.json(result);
+  } catch (e) {
+    console.error('[fiscalization:register-wtn]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/api/fiscalization/register-invoice', needAuth, async (req, res) => {
   try {
     const { invoice, config } = req.body || {};

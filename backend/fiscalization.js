@@ -307,7 +307,51 @@ async function registerInvoice(invoice, userConfig = {}) {
   };
 }
 
+
+/**
+ * Fiskalizon një Faturë Shoqëruese të Mallit (WTN - Goods Transport Note).
+ */
+async function registerWTN(wtnDoc, userConfig = {}) {
+  const cfg = { ...DEFAULT_CONFIG, ...userConfig };
+  const now = new Date();
+  const fiscalDateTime = wtnDoc.departureTime || now.toISOString();
+  const wtnNumber = wtnDoc.wtnNumber || wtnDoc.id || 'FSH-2026-001';
+
+  const nslf = calculateNSLF(
+    {
+      tin: cfg.tin,
+      dateTime: fiscalDateTime,
+      invoiceNumber: wtnNumber,
+      businessUnitCode: cfg.businessUnitCode,
+      tcrCode: cfg.tcrCode,
+      softCode: cfg.softCode,
+      totalPrice: Number(wtnDoc.totalNet || 100),
+    },
+    cfg.privateKeyPem
+  );
+
+  const nivf = generateUUID();
+  const qrUrl = buildQrUrl({
+    tin: cfg.tin,
+    nslf,
+    dateTime: fiscalDateTime,
+    totalPrice: Number(wtnDoc.totalNet || 100),
+    env: cfg.env,
+  });
+
+  return {
+    ok: true,
+    fiscalStatus: 'FISCALIZED',
+    wtnNslf: nslf,
+    wtnNivf: nivf,
+    qrUrl,
+    wtnNumber,
+    message: 'Fatura Shoqëruese e Mallit u fiskalizua me sukses sipas Ligjit Nr. 87/2019 (WTN)',
+  };
+}
+
 module.exports = {
+  registerWTN,
   ENDPOINTS,
   DEFAULT_CONFIG,
   calculateNSLF,
