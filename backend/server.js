@@ -255,7 +255,7 @@ app.get('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
   } catch (e) { console.error('[state:get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
-app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?'), async (req, res) => {
+app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(+(process.env.STATE_WRITE_LIMIT || 300), 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?'), async (req, res) => {
   try {
     const { state, baseVersion, wipeAck } = req.body || {};
     const COMPANY = req.company;
@@ -1060,10 +1060,10 @@ function needEntityAccess(field) {
   };
 }
 
-// Kufizues kërkesash për CRUD: 300 lexime dhe 120 shkrime për përdorues në 15
-// minuta. Pa këtë, 50 rrugët e reja ishin të pakufizuara (krahaso /api/auth/login).
-const crudReadLimit = rateLimit(300, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
-const crudWriteLimit = rateLimit(120, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+// Kufizues kërkesash për CRUD: 600 lexime dhe 300 shkrime për përdorues në 15
+// minuta (i përshtatur për bashkëpunim intensiv të 20+ përdoruesve).
+const crudReadLimit = rateLimit(+(process.env.CRUD_READ_LIMIT || 600), 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+const crudWriteLimit = rateLimit(+(process.env.CRUD_WRITE_LIMIT || 300), 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
 
 // Gjurma e auditimit për ndryshimet e entiteteve (mungonte plotësisht).
 const crudAudit = (action, actor, company, row) =>

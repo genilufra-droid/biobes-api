@@ -45,8 +45,9 @@ function getPool() {
     pool = new Pool({
       connectionString: sanitizedConnectionString(),
       ssl: sslConfig(),
-      max: 10,
+      max: +(process.env.PG_POOL_MAX || 20),
       idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
     });
     pool.on('error', (e) => console.error('[db] pool error:', e.message));
   }
