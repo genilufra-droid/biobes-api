@@ -9,6 +9,7 @@
 //  - ngjarjet globale (kompanitë, të drejtat) shkojnë te të gjithë.
 
 const bus = require('./bus');
+const { log } = require('./log');
 const clients = new Set();
 let seq = 0;
 
