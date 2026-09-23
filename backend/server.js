@@ -1,7 +1,7 @@
 // BioBes API — auth + sinkronizim state + multi-company CRUD + realtime SSE.
 const express = require('express');
 const crypto = require('crypto');
-const { getPool, dbOk } = require('./db');
+const { getPool, dbOk, closePool } = require('./db');
 const { migrate } = require('./migrate');
 const { validateState } = require('./validateState');
 const { ensureAdmin, loginUser, userFromToken, logoutToken, rateLimit, verifyPassword, hashPassword, groupsForUser } = require('./auth');
@@ -12,6 +12,7 @@ const crud = require('./crud');
 const zlib = require('zlib');
 
 const app = express();
+let shuttingDown = false;
 app.set('trust proxy', 1); // Render: IP reale e klientit për rate-limit
 const PORT = process.env.PORT || 3000;
 const MAX_STATE_BYTES = 25 * 1024 * 1024; // njëjtë me RESTORE_MAX_BYTES në frontend
@@ -23,6 +24,9 @@ const STATE_FETCH_POLICY = 'server-authoritative';
 
 // CORS minimal (MVP): origjina e frontend-it ose * nëse nuk është vendosur.
 app.use((req, res, next) => {
+  // Gjatë mbylljes së butë, kërkesat e reja refuzohen menjëherë në vend që të
+  // presin dhe të dështojnë kur Render-i e mbyll procesin me forcë.
+  if (shuttingDown) { res.setHeader('Connection', 'close'); return res.status(503).json({ ok: false, error: 'Serveri po mbyllet — provoni përsëri' }); }
   res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,POST,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -978,24 +982,50 @@ events.startHeartbeat();
 // ?company= (ose header X-Company-Id) dhe filtrohet nga companies.needCompany(),
 // kështu që një kompani nuk sheh kurrë të dhënat e tjetrës.
 const ENTITIES = [
-  ['products', { table: 'products', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
-  ['suppliers', { table: 'suppliers', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
-  ['customers', { table: 'customers', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
-  ['warehouses', { table: 'warehouses', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
-  ['lots', { table: 'lots', searchColumns: ['lot_number'], jsonColumns: ['meta'] }],
-  ['weighings', { table: 'weighings', searchColumns: ['lot_id', 'product_id'], jsonColumns: ['meta'] }],
-  ['payments', { table: 'payments', searchColumns: ['supplier_id', 'notes'], jsonColumns: ['meta'] }],
-  ['customer-payments', { table: 'customer_payments', searchColumns: ['customer_id', 'notes'], jsonColumns: ['meta'] }],
-  ['sales-invoices', { table: 'sales_invoices', searchColumns: ['number', 'customer_id'], jsonColumns: ['meta', 'items'] }],
-  ['purchase-invoices', { table: 'purchase_invoices', searchColumns: ['number', 'supplier_id'], jsonColumns: ['meta', 'items'] }],
+  ['products', { table: 'products', field: 'products', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['suppliers', { table: 'suppliers', field: 'suppliers', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['customers', { table: 'customers', field: 'customers', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['warehouses', { table: 'warehouses', field: 'warehouses', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['lots', { table: 'lots', field: 'lots', searchColumns: ['lot_number'], jsonColumns: ['meta'] }],
+  ['weighings', { table: 'weighings', field: 'weighings', searchColumns: ['lot_id', 'product_id'], jsonColumns: ['meta'] }],
+  ['payments', { table: 'payments', field: 'payments', searchColumns: ['supplier_id', 'notes'], jsonColumns: ['meta'] }],
+  ['customer-payments', { table: 'customer_payments', field: 'customerPayments', searchColumns: ['customer_id', 'notes'], jsonColumns: ['meta'] }],
+  ['sales-invoices', { table: 'sales_invoices', field: 'salesInvoices', searchColumns: ['number', 'customer_id'], jsonColumns: ['meta', 'items'] }],
+  ['purchase-invoices', { table: 'purchase_invoices', field: 'purchaseInvoices', searchColumns: ['number', 'supplier_id'], jsonColumns: ['meta', 'items'] }],
 ];
+
+// Qasja sipas moduleve për entitetet: një përdorues jo-superuser shkruan vetëm
+// nëse fusha përkatëse e gjendjes është në modulet e tij (i njëjti model që
+// zbaton access.applyStateModules për /api/state). Superuser-i kalon gjithmonë.
+function needEntityAccess(field) {
+  return (req, res, next) => {
+    try {
+      if (req.access && req.access.superuser === true) return next();
+      const fields = (req.access && req.access.modules && req.access.modules.allowedFields) || [];
+      if (Array.isArray(fields) && fields.includes(field)) return next();
+      return res.status(403).json({ ok: false, error: 'Nuk keni të drejtë mbi këtë entitet (' + field + ')' });
+    } catch (e) { console.error('[entity-access]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+  };
+}
+
+// Kufizues kërkesash për CRUD: 300 lexime dhe 120 shkrime për përdorues në 15
+// minuta. Pa këtë, 50 rrugët e reja ishin të pakufizuara (krahaso /api/auth/login).
+const crudReadLimit = rateLimit(300, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+const crudWriteLimit = rateLimit(120, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+
+// Gjurma e auditimit për ndryshimet e entiteteve (mungonte plotësisht).
+const crudAudit = (action, actor, company, row) =>
+  audit(actor, action, String(row && row.id ? row.id : ''), company);
+
 for (const [path, cfg] of ENTITIES) {
-  const c = crud.buildCrud(cfg.table, cfg);
-  app.get(`/api/${path}`, needDb, needAuth, companies.needCompany(), c.list);
-  app.post(`/api/${path}`, needDb, needAuth, companies.needCompany(), c.create);
-  app.get(`/api/${path}/:id`, needDb, needAuth, companies.needCompany(), c.get);
-  app.patch(`/api/${path}/:id`, needDb, needAuth, companies.needCompany(), c.update);
-  app.delete(`/api/${path}/:id`, needDb, needAuth, companies.needCompany(), c.remove);
+  const c = crud.buildCrud(cfg.table, { ...cfg, audit: crudAudit });
+  const read = [needDb, needAuth, companies.needCompany(), needEntityAccess(cfg.field), crudReadLimit];
+  const write = [needDb, needAuth, companies.needCompany(), needEntityAccess(cfg.field), crudWriteLimit];
+  app.get(`/api/${path}`, ...read, c.list);
+  app.post(`/api/${path}`, ...write, c.create);
+  app.get(`/api/${path}/:id`, ...read, c.get);
+  app.patch(`/api/${path}/:id`, ...write, c.update);
+  app.delete(`/api/${path}/:id`, ...write, c.remove);
 }
 
 // Pastrimi i të dhënave relacionale të NJË kompanie (migrimi 009).
@@ -1038,5 +1068,26 @@ app.use((err, req, res, next) => {
 (async () => {
   try { if (await migrate()) await ensureAdmin(); }
   catch (e) { console.error('[boot] databaza dështoi:', e.message, '— vazhdohet pa DB.'); }
-  app.listen(PORT, '0.0.0.0', () => console.log(`[biobes-api] live në portën ${PORT}`));
+  const server = app.listen(PORT, '0.0.0.0', () => console.log(`[biobes-api] live në portën ${PORT}`));
+
+  // ===== Mbyllja e butë =====================================================
+  // Render-i dërgon SIGTERM dhe pret ~10 s. Pa këtë trajtues, çdo deploy i
+  // priste në mes kërkesat në zhvillim (p.sh. një PUT /api/state prej 2.7 MB)
+  // dhe i linte lidhjet SSE të varura deri në timeout.
+  const shutdown = (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log('[shutdown] ' + sig + ' — mbyllet me hijësi…');
+    const n = events.closeAll();
+    if (n) console.log('[shutdown] ' + n + ' lidhje SSE të njoftuara.');
+    server.close(async () => {
+      try { await closePool(); } catch (e) {}
+      console.log('[shutdown] gati.');
+      process.exit(0);
+    });
+    // Nëse ndonjë kërkesë ngec, mos e mbaj shërbimin peng përtej afatit.
+    setTimeout(() => { console.error('[shutdown] afati kaloi — dalje me forcë.'); process.exit(1); }, 9000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 })();
