@@ -51,6 +51,17 @@ const rightsChanged = (payload = {}) =>
 const wiped = (company, wipedAt, actor) =>
   broadcast('state-changed', { company, wiped: true, wipedAt, actor, at: new Date().toISOString() }, { company });
 
+// Mbyll çdo lidhje SSE të hapur (përdoret nga mbyllja e butë e serverit,
+// që klientët të mos presin timeout-in e Render-it gjatë një deploy-i).
+function closeAll() {
+  let n = 0;
+  for (const c of [...clients]) {
+    try { c.res.write('event: goodbye\ndata: {}\n\n'); c.res.end(); n++; } catch (e) {}
+    clients.delete(c);
+  }
+  return n;
+}
+
 // Pastrim i periodik i lidhjeve të thyera (pajisje që humbin rrjetin pa u shkëputur).
 function startHeartbeat(intervalMs = 25000) {
   const t = setInterval(() => {
@@ -62,4 +73,4 @@ function startHeartbeat(intervalMs = 25000) {
   return t;
 }
 
-module.exports = { add, remove, size, list, send, broadcast, stateChanged, companiesChanged, rightsChanged, wiped, startHeartbeat };
+module.exports = { add, remove, size, list, send, closeAll, broadcast, stateChanged, companiesChanged, rightsChanged, wiped, startHeartbeat };

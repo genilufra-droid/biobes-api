@@ -17,7 +17,7 @@ const MODEL_MODULES = {
     'MOD-PUR': ['suppliers', 'purchaseInvoices'],
     // Financa: pagesa, arkëtime, banka, kontabiliteti, arka
     'MOD-FIN': ['payments', 'customerPayments', 'bankTransactions', 'bankAccounts', 'accounting', 'cashRegisters'],
-    // Administrimi: përdoruesit
+    // Administrimi: kompanitë, përdoruesit, konfigurimet globale
     'MOD-SET': ['users'],
   },
 };

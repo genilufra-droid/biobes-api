@@ -30,7 +30,8 @@ async function ensureAdmin() {
   if (pass.length < 8) { console.log('[auth] ADMIN_PASSWORD shumë i shkurtër (min 8 karaktere) — admini NUK u krijua.'); return; }
   const username = process.env.ADMIN_USERNAME || 'admin';
   await p.query(
-    `INSERT INTO users(id,username,name,role,password_hash) VALUES('USR-ADMIN',$1,'Administrator','ROLE-ADMIN',$2)`,
+    `INSERT INTO users(id,username,name,role,password_hash,is_superadmin)
+     VALUES('USR-ADMIN',$1,'Administrator','ROLE-ADMIN',$2,TRUE)`,
     [username, hashPassword(pass)]
   );
   // Në skemën Odoo të qasjes: admini fillestar futet edhe në grupin Administrator.
@@ -50,7 +51,9 @@ function toClientUser(u) {
     role: u.role,
     email: u.email || '',
     rights: u.rights || null,
-    is_superuser: u.role === 'ROLE-ADMIN',
+    active: !!u.active,
+    is_superuser: u.role === 'ROLE-ADMIN' || !!u.is_superadmin,
+    is_superadmin: !!u.is_superadmin,
   };
 }
 
@@ -78,7 +81,8 @@ async function userFromToken(token) {
   if (!p) return null;
   const th = crypto.createHash('sha256').update(String(token)).digest('hex');
   const { rows } = await p.query(
-    `SELECT u.id,u.username,u.name,u.role,u.rights,u.email FROM sessions s JOIN users u ON u.id=s.user_id
+    `SELECT u.id,u.username,u.name,u.role,u.rights,u.email,u.is_superadmin,u.active
+     FROM sessions s JOIN users u ON u.id=s.user_id
      WHERE s.token_hash=$1 AND s.expires_at>NOW() AND u.active=TRUE`, [th]);
   return rows[0] || null;
 }

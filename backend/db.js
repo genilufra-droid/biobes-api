@@ -65,4 +65,11 @@ async function dbOk() {
   }
 }
 
-module.exports = { getPool, dbOk };
+// Mbyll pool-in e lidhjeve (mbyllje e butë e serverit).
+async function closePool() {
+  if (!pool) return;
+  try { await pool.end(); } catch (e) { console.error('[db] close:', e.message); }
+  pool = null;
+}
+
+module.exports = { getPool, dbOk, closePool };

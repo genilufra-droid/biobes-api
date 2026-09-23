@@ -8,6 +8,7 @@
     "start": "node server.js",
     "import": "node import-backup.js",
     "export": "node export-backup.js",
+    "export:company": "node export-company-backup.js",
     "test:live": "node test-live.js",
     "test:access": "node test-access-local.cjs",
     "test:ratelimit": "node test-ratelimit-local.cjs",
@@ -19,8 +20,10 @@
     "test:migration008": "node test-migration-008-local.cjs",
     "test:multicompany": "node test-multicompany-local.cjs",
     "test:e2e": "node test-e2e-local.cjs",
+    "test:bugs": "node test-bugs-fixes.cjs",
+    "test:multi": "node test-multi-company.cjs",
     "demo:devices": "node demo-two-devices.js",
-    "test:concurrent": "node test-concurrent.js"
+    "test:crudsec": "node test-crud-security-local.cjs"
   },
   "engines": {
     "node": ">=18"

@@ -5,8 +5,31 @@ const fs = require('fs');
 const path = require('path');
 const { getPool } = require('./db');
 
+// Bllokim këshillues (advisory lock) në nivel databaze: nëse dy instanca
+// nisen njëkohësisht (deploy me mbivendosje në Render), e dyta pret në vend
+// që të përpiqet të aplikojë të njëjtat migrime paralelisht.
+const MIGRATION_LOCK_KEY = 727873927; // çfarëdo numri fiks 64-bit
+
 async function migrate() {
   const p = getPool();
+  if (!p) { console.log('[db] DATABASE_URL mungon — serveri niset pa databazë (vetëm /api/health).'); return false; }
+  const gate = await p.connect();
+  let locked = false;
+  try {
+    await gate.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
+    locked = true;
+  } catch (e) {
+    console.log('[db] nuk u mor bllokimi i migrimit (' + e.message + ') — vazhdohet pa të.');
+  }
+  try {
+    return await runMigrations(p);
+  } finally {
+    if (locked) { try { await gate.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]); } catch (e) {} }
+    gate.release();
+  }
+}
+
+async function runMigrations(p) {
   if (!p) { console.log('[db] DATABASE_URL mungon — serveri niset pa databazë (vetëm /api/health).'); return false; }
   await p.query('CREATE TABLE IF NOT EXISTS schema_migrations(filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
   const { rows } = await p.query('SELECT filename FROM schema_migrations');

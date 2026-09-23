@@ -1,22 +1,32 @@
-// BioBes API (MVP) — auth + sinkronizim state + wipe. Aiven Postgres + Render.
+// BioBes API — auth + sinkronizim state + multi-company CRUD + realtime SSE.
 const express = require('express');
 const crypto = require('crypto');
-const { getPool, dbOk } = require('./db');
+const { getPool, dbOk, closePool } = require('./db');
 const { migrate } = require('./migrate');
 const { validateState } = require('./validateState');
 const { ensureAdmin, loginUser, userFromToken, logoutToken, rateLimit, verifyPassword, hashPassword, groupsForUser } = require('./auth');
 const access = require('./access');
 const companies = require('./companies');
 const events = require('./events');
+const crud = require('./crud');
 const zlib = require('zlib');
 
 const app = express();
+let shuttingDown = false;
 app.set('trust proxy', 1); // Render: IP reale e klientit për rate-limit
 const PORT = process.env.PORT || 3000;
 const MAX_STATE_BYTES = 25 * 1024 * 1024; // njëjtë me RESTORE_MAX_BYTES në frontend
 
+// Politika e sinkronizimit: gjithmonë serveri është autoritativ.
+// Frontend-i duhet të bëjë pull në boot dhe të mbishkruajë cache-n lokale.
+const STATE_FETCH_POLICY = 'server-authoritative';
+
+
 // CORS minimal (MVP): origjina e frontend-it ose * nëse nuk është vendosur.
 app.use((req, res, next) => {
+  // Gjatë mbylljes së butë, kërkesat e reja refuzohen menjëherë në vend që të
+  // presin dhe të dështojnë kur Render-i e mbyll procesin me forcë.
+  if (shuttingDown) { res.setHeader('Connection', 'close'); return res.status(503).json({ ok: false, error: 'Serveri po mbyllet — provoni përsëri' }); }
   res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,POST,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -24,6 +34,14 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '30mb' }));
+
+// Përputhshmëri me klientët e degës: header-i X-Company-Id vepron njëjtë si
+// ?company= (main e zgjedh kompaninë nga query/body përmes companies.needCompany()).
+app.use('/api', (req, res, next) => {
+  const h = req.headers['x-company-id'];
+  if (h && !(req.query && req.query.company) && !(req.body && req.body.company)) req.query.company = String(h);
+  next();
+});
 
 // Kompresim gzip për përgjigjet JSON > 1 KB (gjendja është ~2.7 MB → shkarkohet
 // disa herë më shpejt). Pa varësi të reja: zlib i Node-it.
@@ -66,6 +84,11 @@ async function needAuth(req, res, next) {
     const su = access.isSuperuser(user);
     req.access = { user, superuser: su, modules: su ? null : { full: false, allowedModules: [], allowedFields: [] }, allowedModules: [] };
   }
+  // Përputhshmëri me klientët që e zgjedhin kompaninë me header-in X-Company-Id.
+  // main e zgjedh kompaninë me companies.needCompany() (nga ?company=), ndaj e
+  // pasqyrojmë header-in edhe në req.query (shih middleware-in më sipër) dhe këtu
+  // në req.companyId për kodin që e lexon prej andej.
+  req.companyId = String(req.headers['x-company-id'] || '').trim() || null;
   next();
 }
 
@@ -144,7 +167,6 @@ app.get('/api/state/version', needDb, needAuth, companies.needCompany(), async (
     res.json({ ok: true, company: req.company, version: rows.length ? rows[0].version : 0, updatedAt: rows.length ? rows[0].updated_at : null });
   } catch (e) { console.error('[state:version]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
-
 app.post('/api/auth/password', needDb, needAuth, async (req, res) => {
   try {
     const { password } = req.body || {};
@@ -213,10 +235,10 @@ app.get('/api/state', needDb, needAuth, companies.needCompany(), async (req, res
   try {
     const { rows } = await getPool().query('SELECT data,version,updated_at FROM app_state WHERE id=$1', [req.company]);
     const wipedAt = await companies.getWipeMark(getPool(), req.company);
-    if (!rows.length) return res.json({ ok: true, state: null, version: 0, updatedAt: null, wipedAt, company: req.company, modules: req.access.modules });
+    if (!rows.length) return res.json({ ok: true, state: null, version: 0, updatedAt: null, wipedAt, company: req.company, modules: req.access.modules, fetchPolicy: STATE_FETCH_POLICY });
     // Qasja sipas moduleve (Odoo): superuser/Administrator sheh gjithçka; të tjerët vetëm modulet e tyre.
     const state = access.applyStateModules(rows[0].data, req.access.modules);
-    res.json({ ok: true, state, version: rows[0].version, updatedAt: rows[0].updated_at, wipedAt, company: req.company, modules: req.access.modules });
+    res.json({ ok: true, state, version: rows[0].version, updatedAt: rows[0].updated_at, wipedAt, company: req.company, modules: req.access.modules, fetchPolicy: STATE_FETCH_POLICY });
   } catch (e) { console.error('[state:get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
@@ -232,6 +254,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 1
     // Qasja sipas moduleve (Odoo): një user jo-superuser shkruan vetëm modulet
     // që i takojnë; fushat e tjera mbahen siç janë në server (nuk i fshin të tjerët).
     let stateToStore = state;
+    let mergedFromServer = false;
     if (req.access && req.access.superuser === false) {
       const scoped = access.applyStateModules(state, req.access.modules);
       const onlyFields = (req.access.modules && req.access.modules.allowedFields) || [];
@@ -242,10 +265,23 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 1
       const base = (cur.rows.length && cur.rows[0].data && typeof cur.rows[0].data === 'object' && !Array.isArray(cur.rows[0].data))
         ? cur.rows[0].data : {};
       stateToStore = Object.assign({}, base, scoped);
+      mergedFromServer = true;
       const vfull = validateState(stateToStore);
       if (!vfull.ok) return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vfull.errors[0], errors: vfull.errors });
     } else {
-      const vstate = validateState(state);
+      // Superuser: refuzojmë state të cunguar që do të fshinte kompani/produkte/fusha kritike.
+      // Nëse klienti dërgon state pjesor, e bashkojmë me atë të serverit (merge mbrojtës)
+      // dhe i kthejmë 409 që të detyrohet ringarkimi.
+      const cur = await p.query('SELECT data,version FROM app_state WHERE id=$1', [COMPANY]);
+      const base = (cur.rows.length && cur.rows[0].data && typeof cur.rows[0].data === 'object' && !Array.isArray(cur.rows[0].data))
+        ? cur.rows[0].data : {};
+      const missingCritical = require('./validateState').CRITICAL_FIELDS.filter((k) => !Array.isArray(state[k]));
+      if (missingCritical.length && cur.rows.length) {
+        // Bashkohem mbrojtës në vend të mbishkrimit (parandaloj humbjen e të dhënave).
+        stateToStore = Object.assign({}, base, state);
+        mergedFromServer = true;
+      }
+      const vstate = validateState(stateToStore, { requireAllKnown: false });
       if (!vstate.ok) return res.status(400).json({ ok: false, error: 'Serveri refuzoi ruajtjen: ' + vstate.errors[0], errors: vstate.errors });
     }
 
@@ -268,7 +304,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 1
       await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version ' + ver + ' (blind)' + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')), COMPANY);
       await clearWipeMark();
       events.stateChanged(COMPANY, ver, req.user.username);
-      return res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString() });
+      return res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString(), mergedFromServer });
     }
     if (!Number.isFinite(+baseVersion)) {
       return res.status(400).json({ ok: false, error: 'baseVersion i pavlefshëm' });
@@ -292,7 +328,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 1
           await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version 1 (init)', COMPANY);
           await clearWipeMark();
           events.stateChanged(COMPANY, 1, req.user.username);
-          return res.json({ ok: true, version: 1, company: COMPANY, updatedAt: new Date().toISOString() });
+          return res.json({ ok: true, version: 1, company: COMPANY, updatedAt: new Date().toISOString(), mergedFromServer });
         }
       }
       const cur2 = await p.query('SELECT version FROM app_state WHERE id=$1', [COMPANY]);
@@ -303,7 +339,7 @@ app.put('/api/state', needDb, needAuth, companies.needCompany(), rateLimit(60, 1
     await audit(req.user.username, 'STATE_PUT', 'company ' + COMPANY + ' version ' + ver + (req.access.superuser ? '' : ' modules=' + (req.access.modules.allowedModules || []).join(',')), COMPANY);
     await clearWipeMark();
     events.stateChanged(COMPANY, ver, req.user.username);
-    res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString() });
+    res.json({ ok: true, version: ver, company: COMPANY, updatedAt: new Date().toISOString(), mergedFromServer });
   } catch (e) { console.error('[state:put]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
@@ -940,6 +976,185 @@ app.get('/api/events', needDb, async (req, res) => {
 });
 events.startHeartbeat();
 
+// ===== CRUD i entiteteve të biznesit (migrimi 009) ===========================
+// Tabelat relacionale me company_id: produktet, furnitorët, klientët, magazinat,
+// lotet, peshimet, pagesat, arkëtimet dhe faturat. Kompania zgjidhet me
+// ?company= (ose header X-Company-Id) dhe filtrohet nga companies.needCompany(),
+// kështu që një kompani nuk sheh kurrë të dhënat e tjetrës.
+const ENTITIES = [
+  ['products', { table: 'products', field: 'products', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['suppliers', { table: 'suppliers', field: 'suppliers', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['customers', { table: 'customers', field: 'customers', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['warehouses', { table: 'warehouses', field: 'warehouses', searchColumns: ['name', 'code'], jsonColumns: ['meta'] }],
+  ['lots', { table: 'lots', field: 'lots', searchColumns: ['lot_number'], jsonColumns: ['meta'] }],
+  ['weighings', { table: 'weighings', field: 'weighings', searchColumns: ['lot_id', 'product_id'], jsonColumns: ['meta'] }],
+  ['payments', { table: 'payments', field: 'payments', searchColumns: ['supplier_id', 'notes'], jsonColumns: ['meta'] }],
+  ['customer-payments', { table: 'customer_payments', field: 'customerPayments', searchColumns: ['customer_id', 'notes'], jsonColumns: ['meta'] }],
+  ['sales-invoices', { table: 'sales_invoices', field: 'salesInvoices', searchColumns: ['number', 'customer_id'], jsonColumns: ['meta', 'items'] }],
+  ['purchase-invoices', { table: 'purchase_invoices', field: 'purchaseInvoices', searchColumns: ['number', 'supplier_id'], jsonColumns: ['meta', 'items'] }],
+];
+
+// Qasja sipas moduleve për entitetet: një përdorues jo-superuser shkruan vetëm
+// nëse fusha përkatëse e gjendjes është në modulet e tij (i njëjti model që
+// zbaton access.applyStateModules për /api/state). Superuser-i kalon gjithmonë.
+function needEntityAccess(field) {
+  return (req, res, next) => {
+    try {
+      if (req.access && req.access.superuser === true) return next();
+      const fields = (req.access && req.access.modules && req.access.modules.allowedFields) || [];
+      if (Array.isArray(fields) && fields.includes(field)) return next();
+      return res.status(403).json({ ok: false, error: 'Nuk keni të drejtë mbi këtë entitet (' + field + ')' });
+    } catch (e) { console.error('[entity-access]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+  };
+}
+
+// Kufizues kërkesash për CRUD: 300 lexime dhe 120 shkrime për përdorues në 15
+// minuta. Pa këtë, 50 rrugët e reja ishin të pakufizuara (krahaso /api/auth/login).
+const crudReadLimit = rateLimit(300, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+const crudWriteLimit = rateLimit(120, 15 * 60 * 1000, (req) => (req.user && req.user.id) || req.ip || '?');
+
+// Gjurma e auditimit për ndryshimet e entiteteve (mungonte plotësisht).
+const crudAudit = (action, actor, company, row) =>
+  audit(actor, action, String(row && row.id ? row.id : ''), company);
+
+for (const [path, cfg] of ENTITIES) {
+  const c = crud.buildCrud(cfg.table, { ...cfg, audit: crudAudit });
+  const read = [needDb, needAuth, companies.needCompany(), needEntityAccess(cfg.field), crudReadLimit];
+  const write = [needDb, needAuth, companies.needCompany(), needEntityAccess(cfg.field), crudWriteLimit];
+  app.get(`/api/${path}`, ...read, c.list);
+  app.post(`/api/${path}`, ...write, c.create);
+  app.get(`/api/${path}/:id`, ...read, c.get);
+  app.patch(`/api/${path}/:id`, ...write, c.update);
+  app.delete(`/api/${path}/:id`, ...write, c.remove);
+}
+
+// Pastrimi i të dhënave relacionale të NJË kompanie (migrimi 009).
+// Plotëson /api/admin/wipe (që pastron vetëm app_state të kompanisë): këtu
+// fshihen produktet, furnitorët, klientët, magazinat, lotet, peshimet, pagesat
+// dhe faturat. Kompanitë e tjera nuk preken.
+app.post('/api/admin/company/:id/wipe', needDb, needAuth, needAdminOnly, async (req, res) => {
+  try {
+    const cid = String(req.params.id || '').trim();
+    const p = getPool();
+    const c = await p.query('SELECT id FROM companies WHERE id=$1', [cid]);
+    if (!c.rows.length) return res.status(404).json({ ok: false, error: 'Kompania nuk ekziston' });
+    const { password } = req.body || {};
+    const admins = await p.query("SELECT * FROM users WHERE role='ROLE-ADMIN' AND active=TRUE ORDER BY created_at LIMIT 5");
+    const admin = admins.rows.find((u) => verifyPassword(String(password || ''), u.password_hash));
+    if (!admin) return res.status(401).json({ ok: false, error: 'Password i gabuar' });
+    for (const t of ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
+                     'payments', 'customer_payments', 'sales_invoices', 'purchase_invoices']) {
+      await p.query(`DELETE FROM ${t} WHERE company_id=$1`, [cid]);
+    }
+    const w = await p.query(`INSERT INTO company_wipe_epoch(company_id,wiped_at,wiped_by)
+                             VALUES($1,NOW(),$2)
+                             ON CONFLICT(company_id) DO UPDATE SET wiped_at=NOW(), wiped_by=$2
+                             RETURNING wiped_at`, [cid, admin.username]);
+    await crud.bumpVersion(cid, admin.username);
+    await audit(admin.username, 'COMPANY_WIPE', 'Të dhënat relacionale të kompanisë ' + cid, cid);
+    events.broadcast('company-wiped', { companyId: cid, at: new Date().toISOString(), actor: admin.username }, { company: cid });
+    res.json({ ok: true, companyId: cid, wipedAt: w.rows[0].wiped_at });
+  } catch (e) { console.error('[company:wipe]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+});
+
+// P3 — GET /api/manual (dhe /:moduleId) në shqip
+require('./routes/manual').register(app, { middleware: [] });
+
+// P3 — GET /api/export/xlsx
+const { buildWorkbook, XLSX_MIME } = require('./lib/xlsx');
+const MODULE_COLUMNS = {
+  products: {
+    sheetName: 'Produktet',
+    title: 'Lista e Produkteve',
+    sql: 'SELECT code, name, unit, balance FROM products WHERE company_id=$1 ORDER BY code',
+    columns: [
+      { key: 'code', header: 'KODI', width: 14 },
+      { key: 'name', header: 'EMËRTIMI', width: 32 },
+      { key: 'unit', header: 'NJËSIA', width: 10 },
+      { key: 'balance', header: 'GJENDJA', width: 14, numFmt: 165 },
+    ],
+  },
+  suppliers: {
+    sheetName: 'Furnitorët',
+    title: 'Lista e Furnitorëve',
+    sql: 'SELECT code, name, tax_id, balance FROM suppliers WHERE company_id=$1 ORDER BY code',
+    columns: [
+      { key: 'code', header: 'KODI', width: 14 },
+      { key: 'name', header: 'FURNITORI', width: 32 },
+      { key: 'tax_id', header: 'NIPT', width: 16 },
+      { key: 'balance', header: 'SALDO', width: 16, numFmt: 164 },
+    ],
+  },
+  customers: {
+    sheetName: 'Klientët',
+    title: 'Lista e Klientëve',
+    sql: 'SELECT code, name, tax_id, balance FROM customers WHERE company_id=$1 ORDER BY code',
+    columns: [
+      { key: 'code', header: 'KODI', width: 14 },
+      { key: 'name', header: 'KLIENTI', width: 32 },
+      { key: 'tax_id', header: 'NIPT', width: 16 },
+      { key: 'balance', header: 'SALDO', width: 16, numFmt: 164 },
+    ],
+  },
+  salesInvoices: {
+    sheetName: 'Faturat Shitje',
+    title: 'Faturat e Shitjes',
+    sql: `SELECT s.number, s.issued_at AS date, c.name AS customer, s.total, s.status
+          FROM sales_invoices s LEFT JOIN customers c ON c.company_id = s.company_id AND c.id = s.customer_id
+          WHERE s.company_id=$1 ORDER BY s.issued_at DESC, s.number`,
+    columns: [
+      { key: 'number', header: 'NUMRI', width: 16 },
+      { key: 'date', header: 'DATA', width: 14, numFmt: 14 },
+      { key: 'customer', header: 'KLIENTI', width: 30 },
+      { key: 'total', header: 'TOTALI', width: 16, numFmt: 164 },
+      { key: 'status', header: 'STATUSI', width: 12 },
+    ],
+  },
+  customerReturns: {
+    sheetName: 'Kthimet',
+    title: 'Kthimet e Klientëve',
+    sql: `SELECT w.id AS number, w.weighed_at AS date, c.name AS customer, w.net AS kg, w.amount AS total
+          FROM weighings w LEFT JOIN customers c ON c.company_id = w.company_id AND c.id = w.customer_id
+          WHERE w.company_id=$1 ORDER BY w.weighed_at DESC`,
+    columns: [
+      { key: 'number', header: 'NUMRI', width: 16 },
+      { key: 'date', header: 'DATA', width: 14, numFmt: 14 },
+      { key: 'customer', header: 'KLIENTI', width: 30 },
+      { key: 'kg', header: 'PESHA (KG)', width: 14, numFmt: 165 },
+      { key: 'total', header: 'VLERA', width: 16, numFmt: 164 },
+    ],
+  },
+};
+
+const sumXlsx = (rs, k) => rs.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+
+app.get('/api/export/xlsx', needDb, needAuth, companies.needCompany(), async (req, res) => {
+  const modKey = String(req.query.module || '');
+  const mod = MODULE_COLUMNS[modKey];
+  if (!mod) return res.status(404).json({ ok: false, error: 'Modul i panjohur për eksport' });
+  try {
+    const { rows } = await getPool().query(mod.sql, [req.company]);
+    const totalRow = {};
+    if (mod.columns.some((col) => col.key === 'kg')) totalRow.kg = sumXlsx(rows, 'kg');
+    if (mod.columns.some((col) => col.key === 'total')) totalRow.total = sumXlsx(rows, 'total');
+    if (mod.columns.some((col) => col.key === 'balance')) totalRow.balance = sumXlsx(rows, 'balance');
+
+    const buf = buildWorkbook({
+      title: mod.title + ' — ' + req.company,
+      sheetName: mod.sheetName,
+      columns: mod.columns,
+      rows,
+      pageSize: Number(process.env.XLSX_PAGE_SIZE || 20),
+      totalRow: Object.keys(totalRow).length ? totalRow : undefined,
+      totalLabel: 'SHUMA',
+    });
+    const fname = (modKey + '-' + new Date().toISOString().slice(0, 10) + '.xlsx');
+    res.setHeader('Content-Type', XLSX_MIME);
+    res.setHeader('Content-Disposition', 'attachment; filename="' + fname + '"');
+    res.send(buf);
+  } catch (e) { console.error('[export:xlsx]', e.message); res.status(500).json({ ok: false, error: 'Gabim gjatë eksportit' }); }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
@@ -951,5 +1166,26 @@ app.use((err, req, res, next) => {
 (async () => {
   try { if (await migrate()) await ensureAdmin(); }
   catch (e) { console.error('[boot] databaza dështoi:', e.message, '— vazhdohet pa DB.'); }
-  app.listen(PORT, '0.0.0.0', () => console.log(`[biobes-api] live në portën ${PORT}`));
+  const server = app.listen(PORT, '0.0.0.0', () => console.log(`[biobes-api] live në portën ${PORT}`));
+
+  // ===== Mbyllja e butë =====================================================
+  // Render-i dërgon SIGTERM dhe pret ~10 s. Pa këtë trajtues, çdo deploy i
+  // priste në mes kërkesat në zhvillim (p.sh. një PUT /api/state prej 2.7 MB)
+  // dhe i linte lidhjet SSE të varura deri në timeout.
+  const shutdown = (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log('[shutdown] ' + sig + ' — mbyllet me hijësi…');
+    const n = events.closeAll();
+    if (n) console.log('[shutdown] ' + n + ' lidhje SSE të njoftuara.');
+    server.close(async () => {
+      try { await closePool(); } catch (e) {}
+      console.log('[shutdown] gati.');
+      process.exit(0);
+    });
+    // Nëse ndonjë kërkesë ngec, mos e mbaj shërbimin peng përtej afatit.
+    setTimeout(() => { console.error('[shutdown] afati kaloi — dalje me forcë.'); process.exit(1); }, 9000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 })();

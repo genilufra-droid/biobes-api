@@ -11,7 +11,9 @@ const {PGlite}=require('@electric-sql/pglite');
  // 1) apliko vetëm deri në 007 (baza "e sotme", pa multi-company)
  await db.exec(fs.readFileSync(path.join(dir,'001_initial.sql'),'utf8'));
  await db.query("INSERT INTO users(id,username,name,role,password_hash) VALUES('USR-ADMIN','admin','Administrator','ROLE-ADMIN','x')");
- for(const f of files){if(f==='001_initial.sql'||f==='008_companies.sql')continue;await db.exec(fs.readFileSync(path.join(dir,f),'utf8'))}
+ // (Vetëm deri në 007: 008 është vetë objekti i provës dhe çdo migrim më i ri
+ //  — p.sh. 009_company_domain.sql — supozon skemën që krijon 008.)
+ for(const f of files){if(f==='001_initial.sql'||f>='008_companies.sql')continue;await db.exec(fs.readFileSync(path.join(dir,f),'utf8'))}
  // 2) të dhëna reale: gjendje, backup, audit, shenja e wipe-it, grupe përdoruesi
  const st={products:[{id:'P1',code:'P1'}],suppliers:[{id:'S1',code:'S1'}],customers:[{id:'C1x',code:'C1x'}],lots:[],settings:{companyName:'BioBes Sh.p.k.'}};
  await db.query("INSERT INTO app_state(id,data,version,updated_at) VALUES('main',$1::jsonb,42,NOW())",[JSON.stringify(st)]);
