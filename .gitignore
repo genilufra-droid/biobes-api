@@ -1,0 +1,7 @@
+node_modules/
+.npm/
+uploads/
+.env
+backend/.env
+backend/.env.example.additions
+*.log
