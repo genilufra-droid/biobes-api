@@ -966,6 +966,36 @@ app.delete('/api/backups/:id', needDb, needAuth, needAdminOnly, async (req, res)
   } catch (e) { console.error('[backups:delete]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
 });
 
+// Backup automatik ditor në server (mbahen 14 të fundit per kompani)
+// dhe pastrim periodik i sesioneve/token-ave të skaduar.
+async function runDailyBackups() {
+  const p = getPool();
+  if (!p) return;
+  try {
+    const list = await companies.listCompanies(p);
+    for (const c of list) {
+      if (c.active === false) continue;
+      const cur = await p.query('SELECT data,version FROM app_state WHERE id=$1', [c.id]);
+      if (!cur.rows.length || !cur.rows[0].data) continue;
+      const raw = JSON.stringify(cur.rows[0].data);
+      if (raw.length > MAX_STATE_BYTES) continue;
+      const label = 'auto-ditor-' + new Date().toISOString().slice(0, 10);
+      const exists = await p.query('SELECT 1 FROM backups WHERE COALESCE(company_id,$1)=$1 AND label=$2 LIMIT 1', [c.id, label]);
+      if (exists.rowCount) continue;
+      await p.query(
+        'INSERT INTO backups(label,taken_by,state_version,size_bytes,payload,company_id) VALUES($1,$2,$3,$4,$5::jsonb,$6)',
+        [label, 'system', cur.rows[0].version || 0, raw.length, raw, c.id]
+      );
+      await p.query('DELETE FROM backups WHERE COALESCE(company_id,$1)=$1 AND id NOT IN (SELECT id FROM backups WHERE COALESCE(company_id,$1)=$1 ORDER BY taken_at DESC, id DESC LIMIT ' + BACKUP_KEEP + ')', [c.id]);
+    }
+    await p.query('DELETE FROM sessions WHERE expires_at < NOW()').catch(() => {});
+    await p.query('DELETE FROM refresh_tokens WHERE expires_at < NOW()').catch(() => {});
+  } catch (e) { console.error('[daily-backup]', e.message); }
+}
+
+setTimeout(runDailyBackups, 60000).unref();
+setInterval(runDailyBackups, 6 * 3600 * 1000).unref();
+
 // ===== Ngjarje në kohë reale (SSE) ==========================================
 // Pajisja hap një lidhje të vetme dhe merr njoftim të menjëhershëm kur ndryshon
 // gjendja e kompanisë së saj, kur krijohet/ndryshohet një kompani ose kur
