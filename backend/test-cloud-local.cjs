@@ -46,7 +46,11 @@ async function boot({ dbPort, apiPort, env = {}, db }) {
   return { call, stop, logs: () => logs, API };
 }
 
-// Klient i vogël SSE: mblidhe çfarë vjen deri sa të duam ne.
+// Klient i vogël SSE. Leximi bëhet rresht pas rreshti (siç e kërkon specifikimi
+// i SSE): një kuadar mund të ketë `event:`, `data:` dhe `id:`, dhe `data` mund të
+// shpërndahet në disa rreshta. Lexuesi i mëparshëm përdorte një regex mbi kuadrin
+// e plotë dhe thyej te `JSON.parse` për shkak të rreshtit `id:` — për këtë CI
+// raportonte "ngjarja nuk mbërriti" ndërsa në të vërtetë ish shpërndarë.
 function sse(url) {
   const events = [];
   let stop = () => {};
@@ -57,16 +61,30 @@ function sse(url) {
       const reader = r.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
+      let cur = { event: 'message', data: [] };
+      const flush = () => {
+        if (cur.data.length) {
+          try { events.push({ event: cur.event, data: JSON.parse(cur.data.join('\n')) }); }
+          catch (e) { events.push({ event: cur.event, data: null, raw: cur.data.join('\n') }); }
+        }
+        cur = { event: 'message', data: [] };
+      };
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           buf += dec.decode(value, { stream: true });
-          const parts = buf.split('\n\n');
-          buf = parts.pop();
-          for (const p of parts) {
-            const m = p.match(/^event:\s*(\S+)\s*\ndata:\s*(.+)$/ms);
-            if (m) events.push({ event: m[1], data: JSON.parse(m[2]) });
+          const lines = buf.split('\n');
+          buf = lines.pop();
+          for (const line of lines) {
+            if (line === '') { flush(); continue; }
+            if (line.startsWith(':')) continue;             // koment/heartbeat
+            const i = line.indexOf(':');
+            const field = i === -1 ? line : line.slice(0, i);
+            let val = i === -1 ? '' : line.slice(i + 1);
+            if (val.startsWith(' ')) val = val.slice(1);
+            if (field === 'event') cur.event = val;
+            else if (field === 'data') cur.data.push(val);
           }
         }
       } catch (e) { /* lidhja u mbyll */ }
