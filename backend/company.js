@@ -4,6 +4,7 @@
 // kështu që kompanitë izolohen plotësisht në nivel databaze.
 const crypto = require('crypto');
 const { getPool } = require('./db');
+const { withCompany, withSystem } = require('./lib/pgCompany');
 
 // Kompani të cilave useri ka qasje (përfshirë role_in_company).
 async function userCompanies(userId, pool) {
@@ -39,31 +40,46 @@ async function resolveActiveCompany(userId, requestedId, pool) {
 async function loadCompanyContext(req, res, next) {
   req.companyId = null;
   req.companyRole = null;
-  if (!req.user) return next();
+  if (!req.user && !req.auth) return next();
+  const user = req.user || { id: req.auth.userId, role: req.auth.role, is_superadmin: req.auth.isSuperadmin };
+  const requestedId = req.headers['x-company-id']
+    ? String(req.headers['x-company-id'])
+    : ((req.query && req.query.company) ? String(req.query.company) : (req.auth && req.auth.companyId));
+
   // Superadmina globale (ROLE-ADMIN pa lidhje kompani) mund të shohë çdo kompani.
-  if (req.user.is_superadmin || req.user.role === 'ROLE-ADMIN') {
-    const cid = req.headers['x-company-id'] ? String(req.headers['x-company-id']) : null;
+  if (user.is_superadmin || user.role === 'ROLE-ADMIN') {
+    const cid = requestedId;
     if (cid) {
       const check = await getPool().query('SELECT id FROM companies WHERE id=$1', [cid]);
       if (check.rows.length) { req.companyId = cid; req.companyRole = 'owner'; return next(); }
     }
     if (!cid) {
       // Nëse s'u dha cid, marrim kompaninë e parë të userit (nëse ka), ose asnjë.
-      const list = await userCompanies(req.user.id);
+      const list = await userCompanies(user.id);
       if (list.length) { req.companyId = list[0].id; req.companyRole = list[0].role_in_company; }
       return next();
     }
   }
-  const requestedId = req.headers['x-company-id'] ? String(req.headers['x-company-id']) : null;
-  const c = await resolveActiveCompany(req.user.id, requestedId);
+  const c = await resolveActiveCompany(user.id, requestedId);
   if (c) { req.companyId = c.id; req.companyRole = c.role_in_company; }
   next();
 }
 
 // Middleware që kërkon kompani (400 nëse s'ka).
 function requireCompany(req, res, next) {
-  if (!req.companyId) return res.status(400).json({ ok: false, error: 'Zgjidhni një kompani (X-Company-Id header)', availableCompanies: req.user ? [] : [] });
+  if (!req.companyId) return res.status(400).json({ ok: false, error: 'Zgjidhni një kompani (X-Company-Id header)', availableCompanies: [] });
   next();
+}
+
+function getCtx(req) {
+  if (req.companyCtx) return req.companyCtx;
+  const isSuper = !!(req.user && (req.user.is_superadmin || req.user.role === 'ROLE-ADMIN')) || !!(req.auth && req.auth.isSuperadmin);
+  const userId = (req.user && req.user.id) || (req.auth && req.auth.userId) || '';
+  return {
+    companyId: req.companyId,
+    userId,
+    isSuperadmin: isSuper,
+  };
 }
 
 // Ndihmës CRUD gjenerik për tabelat me (company_id, id, …).
@@ -71,7 +87,6 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
   return {
     async list(req, res) {
       try {
-        const p = getPool();
         const limit = Math.min(Math.max(+req.query.limit || 200, 1), 1000);
         const offset = Math.max(+req.query.offset || 0, 0);
         const q = (req.query.q || '').toString().trim();
@@ -82,17 +97,25 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
           where += ' AND (' + conds.join(' OR ') + ')';
           searchColumns.forEach(() => params.push('%' + q + '%'));
         }
-        const { rows } = await p.query(
-          `SELECT * FROM ${table} ${where} ORDER BY ${defaultSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-          [...params, limit, offset]
-        );
-        const totalR = await p.query(`SELECT COUNT(*)::int AS c FROM ${table} ${where}`, params);
-        res.json({ ok: true, rows, total: totalR.rows[0].c, limit, offset });
+        const ctx = getCtx(req);
+        const out = await withCompany(ctx, async (client) => {
+          const { rows } = await client.query(
+            `SELECT * FROM ${table} ${where} ORDER BY ${defaultSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, offset]
+          );
+          const totalR = await client.query(`SELECT COUNT(*)::int AS c FROM ${table} ${where}`, params);
+          return { rows, total: totalR.rows[0].c };
+        });
+        res.json({ ok: true, rows: out.rows, total: out.total, limit, offset });
       } catch (e) { console.error('[' + table + ':list]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
     },
     async get(req, res) {
       try {
-        const { rows } = await getPool().query(`SELECT * FROM ${table} WHERE company_id=$1 AND id=$2`, [req.companyId, req.params.id]);
+        const ctx = getCtx(req);
+        const rows = await withCompany(ctx, async (client) => {
+          const { rows: r } = await client.query(`SELECT * FROM ${table} WHERE company_id=$1 AND id=$2`, [req.companyId, req.params.id]);
+          return r;
+        });
         if (!rows.length) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
         res.json({ ok: true, row: rows[0] });
       } catch (e) { console.error('[' + table + ':get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
@@ -101,7 +124,6 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
       try {
         const body = req.body || {};
         const id = body.id || (table.slice(0, 3).toUpperCase() + '-' + crypto.randomBytes(4).toString('hex').toUpperCase());
-        const p = getPool();
         const cols = ['company_id', 'id'];
         const vals = [req.companyId, id];
         const placeholders = ['$1', '$2'];
@@ -113,10 +135,14 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
           vals.push(jsonColumns.includes(k) ? JSON.stringify(v && typeof v === 'object' ? v : {}) : v);
         }
         cols.push('updated_at'); placeholders.push('NOW()');
-        const { rows } = await p.query(
-          `INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders.join(',')}) RETURNING *`,
-          vals
-        );
+        const ctx = getCtx(req);
+        const rows = await withCompany(ctx, async (client) => {
+          const { rows: r } = await client.query(
+            `INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders.join(',')}) RETURNING *`,
+            vals
+          );
+          return r;
+        });
         await bumpVersion(req.companyId, req.user && req.user.username);
         res.status(201).json({ ok: true, row: rows[0] });
       } catch (e) {
@@ -127,7 +153,6 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
     async update(req, res) {
       try {
         const body = req.body || {};
-        const p = getPool();
         const set = [];
         const vals = [req.companyId, req.params.id];
         let i = 3;
@@ -138,10 +163,14 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
         }
         set.push('updated_at = NOW()');
         if (!set.length) return res.status(400).json({ ok: false, error: 'Asnjë fushë për përditësim' });
-        const { rows } = await p.query(
-          `UPDATE ${table} SET ${set.join(', ')} WHERE company_id=$1 AND id=$2 RETURNING *`,
-          vals
-        );
+        const ctx = getCtx(req);
+        const rows = await withCompany(ctx, async (client) => {
+          const { rows: r } = await client.query(
+            `UPDATE ${table} SET ${set.join(', ')} WHERE company_id=$1 AND id=$2 RETURNING *`,
+            vals
+          );
+          return r;
+        });
         if (!rows.length) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
         await bumpVersion(req.companyId, req.user && req.user.username);
         res.json({ ok: true, row: rows[0] });
@@ -149,7 +178,11 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
     },
     async remove(req, res) {
       try {
-        const { rowCount } = await getPool().query(`DELETE FROM ${table} WHERE company_id=$1 AND id=$2`, [req.companyId, req.params.id]);
+        const ctx = getCtx(req);
+        const rowCount = await withCompany(ctx, async (client) => {
+          const { rowCount: rc } = await client.query(`DELETE FROM ${table} WHERE company_id=$1 AND id=$2`, [req.companyId, req.params.id]);
+          return rc;
+        });
         if (!rowCount) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
         await bumpVersion(req.companyId, req.user && req.user.username);
         res.json({ ok: true, deleted: req.params.id });
@@ -162,13 +195,14 @@ function buildCrud(table, { defaultSort = 'created_at DESC', searchColumns = ['n
 async function bumpVersion(companyId, actor) {
   if (!companyId) return;
   try {
-    const p = getPool();
-    const r = await p.query(
-      `INSERT INTO company_sync(company_id,version,updated_at) VALUES($1,1,NOW())
-       ON CONFLICT(company_id) DO UPDATE SET version=company_sync.version+1, updated_at=NOW()
-       RETURNING version, updated_at`,
-      [companyId]
-    );
+    const r = await withSystem(async (client) => {
+      return client.query(
+        `INSERT INTO company_sync(company_id,version,updated_at) VALUES($1,1,NOW())
+         ON CONFLICT(company_id) DO UPDATE SET version=company_sync.version+1, updated_at=NOW()
+         RETURNING version, updated_at`,
+        [companyId]
+      );
+    });
     // Importohet dinamikisht për të mos krijuar cikël me server.js.
     const { broadcastCompanyEvent } = require('./server-realtime');
     broadcastCompanyEvent(companyId, 'entity-changed', {

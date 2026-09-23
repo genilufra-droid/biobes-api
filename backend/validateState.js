@@ -39,8 +39,8 @@ function validateState(x, opts) {
   const errors = [];
   if (!x || typeof x !== 'object' || Array.isArray(x)) return { ok: false, errors: ['State-i nuk është objekt'] };
   const presentKnown = KNOWN.filter((k) => x[k] !== undefined && (!onlyFields || onlyFields.has(k)));
-  if (presentKnown.length < 1 && Object.keys(x).length < 3) {
-    errors.push('State-i nuk përmban fusha të njohura');
+  if ((!onlyFields && presentKnown.length < 3) || presentKnown.length < 1) {
+    errors.push('State-i duhet të përmbajë të paktën 3 fusha të njohura');
   }
   const scope = onlyFields || new Set(KNOWN);
   KNOWN.forEach((k) => {
