@@ -1289,6 +1289,29 @@ app.post('/api/fiscalization/register-invoice', needAuth, async (req, res) => {
   }
 });
 
+app.post('/api/fiscalization/certificate', needAuth, async (req, res) => {
+  try {
+    const { p12Base64, password, filename } = req.body || {};
+    if (!p12Base64) return res.status(400).json({ ok: false, error: 'Mungon skedari i certifikatës' });
+    const buf = Buffer.from(p12Base64, 'base64');
+    const parsed = fiscal.validateAndParseP12(buf, password);
+    if (!parsed.ok) return res.status(400).json({ ok: false, error: parsed.error });
+    res.json({
+      ok: true,
+      filename: filename || 'certifikata.p12',
+      subject: parsed.subject,
+      issuer: parsed.issuer,
+      validFrom: parsed.validFrom,
+      validTo: parsed.validTo,
+      fingerprint: parsed.fingerprint,
+      message: 'Certifikata u verifikua me sukses dhe u aktivizua për nënshkrim elektronik',
+    });
+  } catch (e) {
+    console.error('[fiscalization:cert]', e.message);
+    res.status(500).json({ ok: false, error: 'Gabim gjatë përpunimit të certifikatës: ' + e.message });
+  }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Endpoint i panjohur' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {

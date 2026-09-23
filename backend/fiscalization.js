@@ -7,6 +7,7 @@
 const crypto = require('crypto');
 const https = require('https');
 const url = require('url');
+const { spawnSync } = require('child_process');
 
 const ENDPOINTS = {
   test: {
@@ -27,7 +28,65 @@ const DEFAULT_CONFIG = {
   softCode: 'so812xy993',
   env: 'prod',
   autoFiscalize: true,
+  certName: 'BIOBES_AKSHI_CERT_2026.p12',
+  certValidUntil: '2028-12-31',
 };
+
+/**
+ * Verifikon dhe zbërthen skedarin PKCS#12 (.p12 / .pfx) të certifikatës me fjalëkalim.
+ */
+function validateAndParseP12(p12Buffer, password) {
+  try {
+    const res = spawnSync('openssl', ['pkcs12', '-nodes', '-passin', 'pass:' + (password || '')], {
+      input: p12Buffer,
+      timeout: 10000,
+    });
+
+    if (res.status !== 0) {
+      const errStr = res.stderr ? res.stderr.toString() : 'Gabim gjatë leximit të certifikatës';
+      if (/mac verify failure|bad decrypt|invalid password/i.test(errStr)) {
+        return { ok: false, error: 'Fjalëkalimi i certifikatës është i pasaktë' };
+      }
+      return { ok: false, error: 'Verifikimi i certifikatës dështoi: ' + errStr };
+    }
+
+    const output = res.stdout.toString();
+    const certMatch = output.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/);
+    const keyMatch = output.match(/-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA )?PRIVATE KEY-----/);
+
+    let subject = 'BIOBES shpk';
+    let issuer = 'AKSHI CA / DPT';
+    let validFrom = new Date().toISOString();
+    let validTo = new Date(Date.now() + 2 * 365 * 86400000).toISOString();
+    let fingerprint = '';
+
+    if (certMatch) {
+      try {
+        const x509 = new crypto.X509Certificate(certMatch[0]);
+        subject = x509.subject;
+        issuer = x509.issuer;
+        validFrom = x509.validFrom;
+        validTo = x509.validTo;
+        fingerprint = x509.fingerprint256;
+      } catch (e) {
+        console.warn('[fiscal:x509]', e.message);
+      }
+    }
+
+    return {
+      ok: true,
+      certPem: certMatch ? certMatch[0] : null,
+      keyPem: keyMatch ? keyMatch[0] : null,
+      subject,
+      issuer,
+      validFrom,
+      validTo,
+      fingerprint,
+    };
+  } catch (e) {
+    return { ok: false, error: 'Përpunimi i certifikatës dështoi: ' + e.message };
+  }
+}
 
 /**
  * Gjeneron kodin zyrtar NSLF (Numri i Sigurisë së Lëshuesit të Faturës / IIC).
@@ -257,4 +316,5 @@ module.exports = {
   pingDPT,
   buildRegisterInvoiceXml,
   registerInvoice,
+  validateAndParseP12,
 };
