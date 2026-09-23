@@ -8,7 +8,10 @@
 // kjo listë, ajo konsiderohet "e panjohur" dhe pranohet pa validim
 // (për fushat e reja nga frontend-i që ende s'janë përditësuar).
 const CORE_ARRAYS = ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
-  'purchaseInvoices', 'salesInvoices', 'orders', 'payments', 'customerPayments', 'users'];
+  'purchaseInvoices', 'salesInvoices', 'orders', 'payments', 'customerPayments', 'users',
+  // Kthimet (qendra e kthimeve te klientët/furnitorët) — pa këtu ishin fusha
+  // "të panjohura", pra nuk testohet forma e tyre në asnjë PUT.
+  'customerReturns', 'supplierReturns'];
 const KNOWN = CORE_ARRAYS;
 
 // Fushat kritike që S'DO TË MUNGTËN kurrë nga një PUT nga një superuser
