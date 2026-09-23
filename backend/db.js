@@ -45,10 +45,14 @@ function getPool() {
     pool = new Pool({
       connectionString: sanitizedConnectionString(),
       ssl: sslConfig(),
-      max: 10,
+      max: Math.max(1, Number(process.env.POOL_MAX || 10)),
       idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
     });
     pool.on('error', (e) => console.error('[db] pool error:', e.message));
+    // Një pengesë e shkurtër e databazës nuk duhet të bllokojë kërkesat pafund:
+    // presim deri në 10 s për një lidhje, pastaj dështojmë shpejt (dhe klienti riprovojn).
+    pool.options = pool.options || {};
   }
   return pool;
 }
@@ -65,6 +69,24 @@ async function dbOk() {
   }
 }
 
+// Ekzekuton një bllok pune Brenda një transaksioni me kontekstin e kompanisë
+// të vendosur në nivel sesioni-transaksioni.
+//
+// Ky funksion është pika e vetme e kontekstit për të gjithë kodin e CRUD-it.
+// Të dyja shenjat pranohen:
+//   withCompany('C1', fn)                                  — vetëm kompania
+//   withCompany({ companyId, userId, isSuperadmin }, fn)   — kontekst i plotë
+// dhe delegon në lib/pgCompany.js, i cili veç kompanisë vendos edhe
+// `app.user_id`, `app.is_superadmin` dhe `SET LOCAL ROLE` kur është caktuar
+// APP_DB_ROLE — pa këto, politikat RLS (010_rls + 015) nuk e njohin përdoruesin.
+async function withCompany(companyOrCtx, fn) {
+  const pg = require('./lib/pgCompany');
+  const ctx = (companyOrCtx && typeof companyOrCtx === 'object')
+    ? companyOrCtx
+    : { companyId: companyOrCtx };
+  return pg.withCompany(ctx, fn);
+}
+
 // Mbyll pool-in e lidhjeve (mbyllje e butë e serverit).
 async function closePool() {
   if (!pool) return;
@@ -72,4 +94,4 @@ async function closePool() {
   pool = null;
 }
 
-module.exports = { getPool, dbOk, closePool };
+module.exports = { getPool, dbOk, closePool, withCompany };

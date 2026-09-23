@@ -1,32 +1,33 @@
-// CRUD i përgjithshëm mbi tabelat relacionale të biznesit (migrimi 009).
-// Çdo tabelë ka (company_id, id); kompania vjen nga middleware-i
-// companies.needCompany() → req.company, kështu që një kompani nuk sheh
-// kurrë të dhënat e tjetrës.
+// CRUD i përgjithshëm mbi tabelat relacionale të biznesit (migrimet 009 + 010).
 //
-// Erdhi nga dega arena/01a0be23-biobes-api (aty ishte buildCrud brenda
-// company.js). Gjatë bashkimit me main u ndava në modul më vete sepse
-// pjesa tjetër e company.js (userCompanies, loadCompanyContext, requireCompany)
-// ishte zëvendësuar tashmë nga companies.js i main-it (Modeli B).
+// Çdo tabelë ka (company_id, id). Kompania vjen nga middleware-i
+// companies.needCompany() → req.company, dhe çdo pyetje ekzekutohet Brenda
+// db.withCompany(), që vendos kontekstin për RLS-në e migrimit 010.
 //
-// SIGURIA (Faza A e auditimit): emrat e kolonave nuk merren më verbatim nga
-// trupi i kërkesës. Çdo çelës kalon nëpër (a) normalizim të shkronjave,
-// (b) refuzim të fushave të rezervuara — përfshirë `Company_ID`, që më parë
-// anashkalonte filtrin dhe zhvendoste rreshta midis kompanive — dhe
-// (c) një whitelist të lexuar nga information_schema.columns.
+// Sjelljet e reja krahas versionit të parë:
+//   * fshirje e butë (tombstones) — rreshti mbetet me deleted_at, që pajisjet
+//     e tjera ta marrin ndryshimin me ?since=;
+//   * version për rresht — klienti që dërgon If-Match të vjetër merr 409;
+//   * unicitet (company_id, code) — indeks unik pjesor në databazë.
 const crypto = require('crypto');
-const { getPool } = require('./db');
+const { getPool, withCompany } = require('./db');
+const { log } = require('./log');
 
 const COMPANY = (req) => req.company || req.companyId || '';
+// Konteksti i plotë për RLS-në (010_rls + 015): pa userId, politikat e anëtarësisë
+// nuk njohin përdoruesin dhe CRUD-i do të kthente zero rreshta.
+const CTX = (req) => ({
+  companyId: COMPANY(req),
+  userId: (req.user && req.user.id) || '',
+  isSuperadmin: !!(req.user && (req.user.is_superadmin || req.user.role === 'ROLE-ADMIN')),
+});
 
-// Fusha që klienti nuk i vendos kurrë: id dhe company_id i caktohen nga
-// serveri, created_at/updated_at nga databaza. Krahasimi bëhet me shkronja
-// të vogla, sepse Postgres i palos identifikuesit e pa-cituar.
-const RESERVED = new Set(['id', 'company_id', 'created_at', 'updated_at']);
-// Forma e lejuar e një emri kolone.
+// Fushat që klienti nuk i vendos kurrë. Krahasimi bëhet me shkronja të vogla,
+// sepse Postgres i palos identifikuesit e pa-cituar ('Company_ID' = company_id).
+const RESERVED = new Set(['id', 'company_id', 'created_at', 'updated_at', 'deleted_at', 'version']);
 const IDENT = /^[a-z_][a-z0-9_]*$/;
 
-// Kolonat e vërteta të tabelës, lexuar një herë nga information_schema dhe
-// mbajtur në cache (skema nuk ndryshon gjatë jetës së procesit).
+// Kolonat e vërteta të tabelës (whitelist nga information_schema, në cache).
 const columnCache = new Map();
 async function allowedColumns(table) {
   if (columnCache.has(table)) return columnCache.get(table);
@@ -51,7 +52,6 @@ async function bumpVersion(companyId, actor) {
        RETURNING version, updated_at`,
       [companyId]
     );
-    // events.js filtron vetë sipas kompanisë (shih events.broadcast).
     const events = require('./events');
     events.broadcast('entity-changed', {
       companyId, version: r.rows[0].version, at: r.rows[0].updated_at, actor: actor || '',
@@ -59,29 +59,33 @@ async function bumpVersion(companyId, actor) {
   } catch (e) { /* mos e thyen kërkesën nëse regjistri i sinkronizimit dështon */ }
 }
 
-// Ndërton handler-at list/get/create/update/remove për një tabelë.
 function buildCrud(table, opts = {}) {
   const {
     defaultSort = 'created_at DESC',
     searchColumns = ['name', 'code'],
     jsonColumns = ['meta'],
-    audit = null, // (action, actor, company, row) → e thërret server.js për gjurmën e auditimit
+    audit = null,
+    label = table,
   } = opts;
 
   const guarded = (fn) => async (req, res) => {
     if (!COMPANY(req)) return res.status(400).json({ ok: false, error: 'Zgjidhni një kompani (?company= ose header X-Company-Id)' });
-    return fn(req, res);
+    try { return await fn(req, res); }
+    catch (e) {
+      if (/new row violates row-level security|violates row-level security policy/i.test(String(e.message))) {
+        log.warn('crud: RLS refuzoi — izolimi i kompanive funksionoi', { table: table, reqId: req.id });
+        return res.status(403).json({ ok: false, error: 'Kjo e dhënë nuk i përket kompanisë tuaj' });
+      }
+      throw e;
+    }
   };
 
-  // Lexon dhe vërteton fushat e ardhura nga klienti.
-  // Kthen { ok: true, data } ose { ok: false, field } — kurrë nuk i fut
-  // emrat e klientit direkt në SQL.
   async function readFields(req) {
     const allowed = await allowedColumns(table);
     const data = {};
     for (const [k, v] of Object.entries(req.body || {})) {
       const key = String(k).toLowerCase();
-      if (RESERVED.has(key)) continue; // injorohet në heshtje (përputhshmëri me klientët)
+      if (RESERVED.has(key)) continue;
       if (!IDENT.test(key) || !allowed.has(key)) return { ok: false, field: String(k) };
       data[key] = jsonColumns.includes(key) ? JSON.stringify(v && typeof v === 'object' ? v : {}) : v;
     }
@@ -93,38 +97,57 @@ function buildCrud(table, opts = {}) {
 
   const writeAudit = async (req, action, row) => {
     if (!audit) return;
-    try { await audit(action, (req.user && req.user.username) || '', COMPANY(req), row); } catch (e) {}
+    try { await audit(action, (req.user && req.user.username) || '', COMPANY(req), row, label); } catch (e) {}
   };
 
   return {
     list: guarded(async (req, res) => {
       try {
-        const p = getPool();
         const limit = Math.min(Math.max(+req.query.limit || 200, 1), 1000);
         const offset = Math.max(+req.query.offset || 0, 0);
         const q = (req.query.q || '').toString().trim();
+        const since = (req.query.since || '').toString().trim();
+        const includeDeleted = String(req.query.includeDeleted || '') === '1' || !!since;
         const params = [COMPANY(req)];
         let where = 'WHERE company_id = $1';
+        // Sinkronizimi: ?since=ISO kthen çdo rresht të prekur që nga ajo kohë,
+        // përfshirë tombstone-t (deleted_at IS NOT NULL).
+        if (since) { where += ` AND updated_at > $2::timestamptz`; params.push(since); }
+        else if (!includeDeleted) where += ' AND deleted_at IS NULL';
         if (q) {
-          const conds = searchColumns.filter((c) => IDENT.test(c)).map((col, i) => `${col} ILIKE $${params.length + 1 + i}`);
+          const cols = searchColumns.filter((c) => IDENT.test(c));
+          const conds = cols.map((col, i) => `${col} ILIKE $${params.length + 1 + i}`);
           where += ' AND (' + conds.join(' OR ') + ')';
-          conds.forEach(() => params.push('%' + q + '%'));
+          cols.forEach(() => params.push('%' + q + '%'));
         }
-        const { rows } = await p.query(
-          `SELECT * FROM ${table} ${where} ORDER BY ${defaultSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-          [...params, limit, offset]
-        );
-        const totalR = await p.query(`SELECT COUNT(*)::int AS c FROM ${table} ${where}`, params);
-        res.json({ ok: true, company: COMPANY(req), rows, total: totalR.rows[0].c, limit, offset });
-      } catch (e) { console.error('[' + table + ':list]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+        const out = await withCompany(CTX(req), async (c) => {
+          const { rows } = await c.query(
+            `SELECT * FROM ${table} ${where} ORDER BY ${defaultSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, offset]
+          );
+          const totalR = await c.query(`SELECT COUNT(*)::int AS c FROM ${table} ${where}`, params);
+          return { rows, total: totalR.rows[0].c };
+        });
+        res.json({ ok: true, company: COMPANY(req), rows: out.rows, total: out.total, limit, offset, since: since || null });
+      } catch (e) {
+        log.exception('crud:list', e, { table, reqId: req.id });
+        res.status(500).json({ ok: false, error: 'Gabim serveri' });
+      }
     }),
 
     get: guarded(async (req, res) => {
       try {
-        const { rows } = await getPool().query(`SELECT * FROM ${table} WHERE company_id=$1 AND id=$2`, [COMPANY(req), req.params.id]);
-        if (!rows.length) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
-        res.json({ ok: true, row: rows[0] });
-      } catch (e) { console.error('[' + table + ':get]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+        const out = await withCompany(CTX(req), async (c) => {
+          const { rows } = await c.query(
+            `SELECT * FROM ${table} WHERE company_id=$1 AND id=$2 AND deleted_at IS NULL`, [COMPANY(req), req.params.id]);
+          return rows[0] || null;
+        });
+        if (!out) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
+        res.json({ ok: true, row: out });
+      } catch (e) {
+        log.exception('crud:get', e, { table, reqId: req.id });
+        res.status(500).json({ ok: false, error: 'Gabim serveri' });
+      }
     }),
 
     create: guarded(async (req, res) => {
@@ -132,19 +155,24 @@ function buildCrud(table, opts = {}) {
         const f = await readFields(req);
         if (!f.ok) return rejectField(res, f.field);
         const keys = Object.keys(f.data);
-        const cols = ['company_id', 'id', ...keys, 'updated_at'];
         const id = (req.body || {}).id || (table.slice(0, 3).toUpperCase() + '-' + crypto.randomBytes(4).toString('hex').toUpperCase());
+        const cols = ['company_id', 'id', ...keys, 'version', 'updated_at'];
         const vals = [COMPANY(req), String(id), ...keys.map((k) => f.data[k])];
-        const ph = cols.map((c, i) => (c === 'updated_at' ? 'NOW()' : '$' + (i + 1)));
-        const { rows } = await getPool().query(
-          `INSERT INTO ${table} (${cols.join(',')}) VALUES (${ph.join(',')}) RETURNING *`, vals
-        );
+        const ph = cols.map((c, i) => (c === 'updated_at' ? 'NOW()' : c === 'version' ? '1' : '$' + (i + 1)));
+        const out = await withCompany(CTX(req), async (c) => {
+          const { rows } = await c.query(
+            `INSERT INTO ${table} (${cols.join(',')}) VALUES (${ph.join(',')}) RETURNING *`, vals);
+          return rows[0];
+        });
         await bumpVersion(COMPANY(req), req.user && req.user.username);
-        await writeAudit(req, 'ENTITY_CREATE', rows[0]);
-        res.status(201).json({ ok: true, row: rows[0] });
+        await writeAudit(req, 'ENTITY_CREATE', out);
+        res.status(201).json({ ok: true, row: out });
       } catch (e) {
-        if (/duplicate|unique/i.test(String(e.message))) return res.status(409).json({ ok: false, error: 'Ekziston një rresht me këtë ID' });
-        console.error('[' + table + ':create]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' });
+        if (/_uniq|duplicate key|violates unique/i.test(String(e.message))) {
+          return res.status(409).json({ ok: false, error: 'Ekziston një rresht me këtë kod/ID në këtë kompani' });
+        }
+        log.exception('crud:create', e, { table, reqId: req.id });
+        res.status(500).json({ ok: false, error: 'Gabim serveri' });
       }
     }),
 
@@ -154,26 +182,58 @@ function buildCrud(table, opts = {}) {
         if (!f.ok) return rejectField(res, f.field);
         const keys = Object.keys(f.data);
         if (!keys.length) return res.status(400).json({ ok: false, error: 'Asnjë fushë për përditësim' });
-        const set = keys.map((k, i) => `${k} = $${i + 3}`).concat(['updated_at = NOW()']);
-        const { rows } = await getPool().query(
-          `UPDATE ${table} SET ${set.join(', ')} WHERE company_id=$1 AND id=$2 RETURNING *`,
-          [COMPANY(req), req.params.id, ...keys.map((k) => f.data[k])]
-        );
-        if (!rows.length) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
+        // Kontroll optimist: nëse klienti dërgon If-Match (ose baseVersion),
+        // refuzohet me 409 kur dikush tjetër e ka ndryshuar që më parë.
+        const want = Number(req.headers['if-match'] || (req.body || {}).baseVersion);
+        const set = keys.map((k, i) => `${k} = $${i + 3}`).concat(['version = version + 1', 'updated_at = NOW()']);
+        const out = await withCompany(CTX(req), async (c) => {
+          const cur = await c.query(`SELECT version FROM ${table} WHERE company_id=$1 AND id=$2 AND deleted_at IS NULL`, [COMPANY(req), req.params.id]);
+          if (!cur.rows.length) return null;
+          if (Number.isFinite(want) && want > 0 && Number(cur.rows[0].version) !== want) return { conflict: cur.rows[0].version };
+          const { rows } = await c.query(
+            `UPDATE ${table} SET ${set.join(', ')} WHERE company_id=$1 AND id=$2 AND deleted_at IS NULL RETURNING *`,
+            [COMPANY(req), req.params.id, ...keys.map((k) => f.data[k])]
+          );
+          return rows[0] || null;
+        });
+        if (!out) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
+        if (out.conflict) return res.status(409).json({ ok: false, error: 'Konflikt versionesh — rreshti u ndryshua diku tjetër', version: out.conflict });
         await bumpVersion(COMPANY(req), req.user && req.user.username);
-        await writeAudit(req, 'ENTITY_UPDATE', rows[0]);
-        res.json({ ok: true, row: rows[0] });
-      } catch (e) { console.error('[' + table + ':update]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+        await writeAudit(req, 'ENTITY_UPDATE', out);
+        res.json({ ok: true, row: out });
+      } catch (e) {
+        if (/_uniq|duplicate key|violates unique/i.test(String(e.message))) {
+          return res.status(409).json({ ok: false, error: 'Ekziston një rresht me këtë kod/ID në këtë kompani' });
+        }
+        log.exception('crud:update', e, { table, reqId: req.id });
+        res.status(500).json({ ok: false, error: 'Gabim serveri' });
+      }
     }),
 
+    // Fshirje e butë si parazgjedhje. ?hard=1 (vetëm admin) e fshin vërtet —
+    // për kërkesat "fshij të dhënat e mia".
     remove: guarded(async (req, res) => {
       try {
-        const { rows } = await getPool().query(`DELETE FROM ${table} WHERE company_id=$1 AND id=$2 RETURNING id`, [COMPANY(req), req.params.id]);
-        if (!rows.length) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
+        const hard = String(req.query.hard || '') === '1' && req.user && req.user.role === 'ROLE-ADMIN';
+        const out = await withCompany(CTX(req), async (c) => {
+          if (hard) {
+            const r = await c.query(`DELETE FROM ${table} WHERE company_id=$1 AND id=$2 RETURNING id`, [COMPANY(req), req.params.id]);
+            return r.rows[0] || null;
+          }
+          const r = await c.query(
+            `UPDATE ${table} SET deleted_at=NOW(), version=version+1, updated_at=NOW()
+              WHERE company_id=$1 AND id=$2 AND deleted_at IS NULL
+             RETURNING id, deleted_at, version`, [COMPANY(req), req.params.id]);
+          return r.rows[0] || null;
+        });
+        if (!out) return res.status(404).json({ ok: false, error: 'Nuk u gjet' });
         await bumpVersion(COMPANY(req), req.user && req.user.username);
-        await writeAudit(req, 'ENTITY_DELETE', rows[0]);
-        res.json({ ok: true, deleted: rows[0].id });
-      } catch (e) { console.error('[' + table + ':remove]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
+        await writeAudit(req, hard ? 'ENTITY_PURGE' : 'ENTITY_DELETE', out);
+        res.json({ ok: true, deleted: out.id, deletedAt: out.deleted_at || null, hard: !!hard });
+      } catch (e) {
+        log.exception('crud:remove', e, { table, reqId: req.id });
+        res.status(500).json({ ok: false, error: 'Gabim serveri' });
+      }
     }),
   };
 }

@@ -23,7 +23,9 @@
     "test:bugs": "node test-bugs-fixes.cjs",
     "test:multi": "node test-multi-company.cjs",
     "demo:devices": "node demo-two-devices.js",
-    "test:crudsec": "node test-crud-security-local.cjs"
+    "test:crudsec": "node test-crud-security-local.cjs",
+    "test:cloud": "node test-cloud-local.cjs",
+    "test:kit": "node test-kit-local.cjs"
   },
   "engines": {
     "node": ">=18"

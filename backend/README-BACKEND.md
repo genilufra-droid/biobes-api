@@ -232,3 +232,91 @@ curl localhost:3000/api/health
 - Përgjigjet JSON > 1 KB kompresohen me gzip (gjendja ~2.7 MB → ~90% më e vogël).
 - Provat: `node test-events-local.cjs` (20 kontrolle) dhe `node test-realtime-load-local.cjs`
   (20 përdorues njëkohësisht: 20 lidhje SSE, 10 shkrues paralelë, 0 humbje — 14 kontrolle).
+
+
+## Gatishmëria për cloud (Faza B + C)
+
+Variablat e rinj të mjedisit — të gjithë me parazgjedhje të sigurta (pa to,
+shërbimi sillet si më parë):
+
+| Variabla | Parazgjedhja | Çfarë bën |
+|---|---|---|
+| `MULTI_INSTANCE` | `0` | `1` = shpërndan ngjarjet midis instancave me `LISTEN/NOTIFY` dhe e kalon kufizuesin e kërkesave në databazë (një kufi për të gjitha instancat). |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logjet dalin në JSON, një rresht për ngjarje. |
+| `POOL_MAX` | `10` | Sa lidhje Postgres mban pishina. |
+| `RATE_LIMIT_READ_MAX` / `RATE_LIMIT_WRITE_MAX` | `300` / `120` | Kufijtë për 15 minuta, të rregullueshëm pa prekur kodin. |
+| `SENTRY_DSN` | – | Dërgon çdo gabim te Sentry (pa SDK: envelope mbi HTTP). |
+| `ERROR_WEBHOOK_URL` | – | Dërgon gabimet në çfarëdo webhook (Slack/Discord/…); `ERROR_WEBHOOK_FORMAT=slack` për formatin e Slack-ut. |
+| `SENTRY_ENVIRONMENT` | `NODE_ENV` | Ndan ngjarjet e staging-ut nga prodhimi. |
+
+### Vëzhgueshmëria
+* Çdo kërkesë merr një `X-Request-Id` që kthehet te klienti dhe figuron në çdo log.
+* `GET /api/health` tregon bazën e të dhënave, sa kohë është ndezur procesi, sa
+  migrime janë aplikuar, sa lidhje SSE ka, commit-in dhe mënyrën e punës
+  (një instancë / shumë instanca).
+* `GET /api/metrics` (vetëm admin) jep metrikat në JSON; `?format=prometheus`
+  i kthen në formatin Prometheus.
+
+### Rimëkëmbja
+* `GET /api/admin/export` (admin) — eksport i plotë: kompani, të gjitha tabelat
+  relacionale, gjendja JSON dhe përdoruesit (pa fjalëkalime).
+* `node scripts/backup-offsite.cjs` — e merr atë eksport, e kompreson dhe e
+  ngarkon në një kovë S3-përputhëse; hedh kopjet më të vjetra se
+  `BACKUP_KEEP_OFFSITE`. Planifikohet natën në GitHub Actions
+  (`.github/workflows/backup-offsite.yml`).
+* `node scripts/load-test.cjs` — provë ngarkese me shumë klientë paralelë;
+  raporton kërkësi/s dhe p50/p95/p99. Për shifra të vërteta jepi `API_URL`.
+
+### Sinkronizimi shumë-pajisjesh
+* Çdo rresht ka `version`. Me `If-Match: <version>` përditësimi refuzohet me
+  **409** nëse dikush tjetër e ka ndryshuar më parë (konkurrencë optimiste).
+* Fshirjet janë të buta (`deleted_at`); me `?since=<ISO>` klienti merr edhe
+  "gurët e varrit", që çdo pajisje t'ia heqë rreshtin vetes.
+* `?hard=1` e fshin përfundimisht (vetëm admin).
+
+### Izolimi midis kompanive
+Përveç filtrit në kod, izolimin tani e zbaton edhe Postgres-i: migrimi `010`
+aktivizon **RLS** (`ENABLE` + `FORCE`) në të gjitha tabelat me `company_id`, dhe
+çdo pyetje kalon nëpër `db.withCompany()`, që vendos
+`set_config('app.company_id', …, true)` brenda një transaksioni. Kujdes: nëse
+lidhja është superpërdorues, RLS anashkalohet — në Aiven `avnadmin` nuk është
+i tillë, ndaj politika zbatohet.
+
+
+## RLS — si funksionon në praktikë (bashkimi i dy qasjeve)
+
+Dy migrime punojnë së bashku:
+
+| Migrim | Çfarë bën |
+|---|---|
+| `010_rls.sql` | krijon funksionet e kontekstit (`app_company_id()`, `app_is_member()`, …), aktivizon `ENABLE`+`FORCE ROW LEVEL SECURITY` në çdo tabelë me `company_id` |
+| `015_rls_hybrid.sql` | bashkon dy politika konkurruese dhe shton rrugën "pa kontekst" |
+
+Politika është **hibride**, dhe kjo është e qëllim:
+
+* **kur konteksti është vendosur** (rruga e CRUD-it, `db.withCompany` →
+  `lib/pgCompany.js`): shihen vetëm rreshtat e kompanisë aktive **dhe** vetëm
+  përdoruesit që janë anëtarë të saj; superadmini kalon. Një `UPDATE`/`DELETE`
+  mbi rreshtin e kompanisë tjetër prek **0 rreshta**, një `INSERT` në kompaninë
+  tjetër refuzohet nga vetë Postgres-i.
+* **kur konteksti nuk është vendosur**: lejohet — sepëse shërbimi ka dhjetëra
+  rrugë që pyesin drejtpërdrejt (`/api/auth/login` lexon `users`, lista e
+  kompanive lexon `companies`, anëtarësia lexon `user_companies`). Pa këtë rrugë,
+  **asnjë nuk do të hynte** — testet lokale nuk e kapin sepse PGlite lidhet si
+  superuser dhe RLS anashkalohet; në Aiven (`avnadmin`, jo-superuser) dështimi
+  do të shfaqej vetëm në prodhim.
+
+Dy detaje që ngarkohen lehtë:
+
+1. **`user_companies` mbetet pa RLS.** Ajo lexohet *brenda* politikave
+   (`app_is_member` → `company_users` → `user_companies`); po t'i vendoset RLS,
+   politikat kërkojnë vetë vetën dhe Postgres-i hedh gabim rekursioni. Nuk
+   përmban të dhëna biznesi, vetëm çiftet (kompani, përdorues).
+2. **`company_users` është një *view*** mbi `user_companies`. I gjithë kodi i
+   aplikacionit përdor `user_companies`; view-i e mban të njëjtin burim të
+   së vërtetës, që të mos shmangen dy tabela.
+
+Në prodhim cakto `APP_DB_ROLE=biobes_app` (e krijon migrimi `014_app_role.sql`):
+Postgres-i **nuk zbaton RLS për superuser**, madje as me `FORCE`. Me
+`SET LOCAL ROLE` (e bën automatikisht `lib/pgCompany.js`) çdo transaksion
+ekzekutohet me një rol jo-superuser, kështu që politikat vlejnë vërtet.
