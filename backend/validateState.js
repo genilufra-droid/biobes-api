@@ -7,41 +7,24 @@
 // Çdo fushë këtu duhet të jetë array në state. Nëse një fushë mungon nga
 // kjo listë, ajo konsiderohet "e panjohur" dhe pranohet pa validim
 // (për fushat e reja nga frontend-i që ende s'janë përditësuar).
-const CORE_ARRAYS = [
-  // Organizimi
-  'companies', 'users', 'warehouses', 'racks', 'machines',
-  // Inventari
-  'products', 'lots', 'weighings', 'processes', 'packagings',
-  'stockMovements', 'inventories', 'inventoryTransfers',
-  'customerReturns', 'supplierReturns', 'alphaMasters',
-  // Palët
-  'suppliers', 'customers',
-  // Dokumentet
-  'purchaseInvoices', 'salesInvoices', 'orders', 'samples',
-  'shipments', 'exportDossiers', 'documents', 'documentSets',
-  // Financa
-  'payments', 'customerPayments', 'bankTransactions', 'bankAccounts',
-  'accounting', 'cashRegisters',
-  // Të ndryshme
-  'events', 'notes', 'tasks', 'notifications',
-];
+const CORE_ARRAYS = ['products', 'suppliers', 'customers', 'warehouses', 'lots', 'weighings',
+  'purchaseInvoices', 'salesInvoices', 'orders', 'payments', 'customerPayments', 'users'];
+const KNOWN = CORE_ARRAYS;
+
 // Fushat kritike që S'DO TË MUNGTËN kurrë nga një PUT nga një superuser
 // (mungesa e tyre tregon se klienti po dërgon një state të cunguar nga cache
 //  e vjetër dhe do të fshinte të dhëna — e refuzojmë në vend që të prishim).
 const CRITICAL_FIELDS = ['companies', 'products', 'customers', 'suppliers', 'warehouses'];
-// Fushat e panjohura pranohen (lehtësojmë përditësimet e frontendit),
-// por duhet të ekzistojë të paktën një fushë e njohur që state-i të mos jetë bosh.
-const KNOWN = CORE_ARRAYS;
-
 function validateState(x, opts) {
   const onlyFields = (opts && Array.isArray(opts.onlyFields)) ? new Set(opts.onlyFields) : null;
   const requireAllKnown = !!(opts && opts.requireAllKnown);
   const errors = [];
   if (!x || typeof x !== 'object' || Array.isArray(x)) return { ok: false, errors: ['State-i nuk është objekt'] };
   const presentKnown = KNOWN.filter((k) => x[k] !== undefined && (!onlyFields || onlyFields.has(k)));
-  if (presentKnown.length < 1 && Object.keys(x).length < 3) {
-    errors.push('State-i nuk përmban fusha të njohura');
-  }
+  // Rregulli i main-it: një state pa të paktën 3 fusha të njohura refuzohet.
+  // (Dega e kishte zbutur në "1 fushë e njohur ose 3 çfarëdo" — do të prishte
+  //  provat e main-it, ndaj mbetet kontrata e main-it.)
+  if (presentKnown.length < 3) errors.push('State-i nuk përmban fusha të njohura (' + presentKnown.length + '/3)');
   const scope = onlyFields || new Set(KNOWN);
   KNOWN.forEach((k) => {
     if (scope.has(k) && x[k] !== undefined && !Array.isArray(x[k])) errors.push(k + ' duhet të jetë array');

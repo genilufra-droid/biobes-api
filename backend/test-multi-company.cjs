@@ -14,15 +14,21 @@ const ok = (name, cond, extra = '') => { cond ? pass++ : fail++; console.log((co
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
+  let child, srv;
   const db = new PGlite();
-  const srv = new PGLiteSocketServer({ db, port: DB_PORT, host: '127.0.0.1', maxConnections: 8 });
+  srv = new PGLiteSocketServer({ db, port: DB_PORT, host: '127.0.0.1', maxConnections: 8 });
   await srv.start();
-  const child = spawn(process.execPath, ['server.js'], {
+  child = spawn(process.execPath, ['server.js'], {
     cwd: __dirname,
     env: { ...process.env, PORT: String(API_PORT), DATABASE_URL: 'postgres://biobes:biobes@127.0.0.1:'+DB_PORT+'/biobes',
            ADMIN_USERNAME:'admin', ADMIN_PASSWORD:PASS, SESSION_TTL_HOURS:'24', PGSSLMODE:'disable' },
     stdio: ['ignore','pipe','pipe'],
   });
+
+  // Pastrim i garantuar: nëse testi dështon në mes, procesi i serverit dhe
+  // PGlite-i mbeteshin gjallë dhe zinin portat (3202/3203, 5434/5435).
+  const cleanup = () => { try { child.kill('SIGKILL'); } catch (_) {} try { srv.stop().catch(() => {}); } catch (_) {} };
+  process.on('exit', cleanup);
   let logs = '';
   child.stdout.on('data', d => logs += d); child.stderr.on('data', d => logs += d);
 
@@ -31,23 +37,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     return { status: r.status, ok: r.ok, data: await r.json().catch(()=>({})) };
   };
   const login = async (u,pw) => call('/api/auth/login',{method:'POST',body:JSON.stringify({username:u,password:pw})});
-  for (let i=0; i<60; i++) { try { if ((await call('/api/health')).ok) break; } catch(_){} await sleep(200); }
+  for (let i = 0; i < 200; i++) { try { if ((await call('/api/health')).ok) break; } catch(_){} await sleep(200); }
 
   const admin = await login('admin', PASS);
   ok('admin-login', admin.ok);
   const HA = { Authorization: 'Bearer ' + admin.data.token };
 
   // Krijojmë 2 kompani.
-  const c1 = await call('/api/companies', { method:'POST', headers:HA, body:JSON.stringify({name:'Kompania A', currency:'ALL'}) });
+  const c1 = await call('/api/admin/companies', { method:'POST', headers:HA, body:JSON.stringify({name:'Kompania A', code:'KA', currency:'ALL'}) });
   ok('create-co-a', c1.ok && c1.data.company, JSON.stringify(c1.data));
-  const c2 = await call('/api/companies', { method:'POST', headers:HA, body:JSON.stringify({name:'Kompania B', currency:'EUR'}) });
+  const c2 = await call('/api/admin/companies', { method:'POST', headers:HA, body:JSON.stringify({name:'Kompania B', code:'KB', currency:'EUR'}) });
   ok('create-co-b', c2.ok && c2.data.company);
   const COA = c1.data.company.id;
   const COB = c2.data.company.id;
 
-  // /api/companies kthen të dyja për admin.
-  const lst = await call('/api/companies', { headers:HA });
-  ok('companies-list-2', lst.ok && lst.data.companies.length === 2, 'n=' + lst.data.companies.length);
+  // Lista e kompanive i përmban të dyja (main krijon edhe C1 të parazgjedhur).
+  const lst = await call('/api/admin/companies', { headers:HA });
+  const ids = (lst.data.companies || []).map((c) => c.id);
+  ok('companies-list-has-a-b', lst.ok && ids.includes(COA) && ids.includes(COB), 'ids=' + ids.join(','));
 
   // Krijoj produkt në KO A.
   const p1 = await call('/api/products', { method:'POST', headers:{...HA, 'X-Company-Id':COA},
@@ -109,4 +116,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   child.kill('SIGTERM'); srv.stop().catch(()=>{});
   if (fail) { console.log('\n--- LOGS ---\n' + logs.slice(-500)); }
   process.exit(fail ? 1 : 0);
-})().catch(e => { console.error('FAIL:', e); process.exit(1); });
+})().catch(e => {
+  console.error('FAIL:', e);
+  console.log('--- LOGS ---\n' + String(typeof logs !== 'undefined' ? logs : '').slice(-1500));
+  try { if (child) child.kill('SIGKILL'); } catch (_) {}
+  try { if (srv) srv.stop().catch(() => {}); } catch (_) {}
+  process.exit(1);
+});

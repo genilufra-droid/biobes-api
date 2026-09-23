@@ -1,39 +1,33 @@
--- 007_multi_company — Skema relacionale për shumë kompani (izolim i plotë).
--- Krijohen tabelat e biznesit në vend të një JSONB të vetëm, me `company_id`
--- në çdo tabelë, që asnjë e dhënë e një kompanie të mos përzihet me tjetrën.
--- Tabela e vjetër app_state mbahet për prapapajtueshmëri me klientët e vjetër,
--- por rekomandohet të migrohen në CRUD.
+-- 009_company_domain — Tabelat relacionale të biznesit për kompani (izolim me company_id).
+--
+-- KY MIGRIM ËSHTË RIFORMULUAR GJATË BASHKIMIT TË DEGËS arena/01a0be23-biobes-api NË main.
+-- Versioni origjinal i degës ishte 007_multi_company.sql, por main e ka zënë numrin 007
+-- (007_backups.sql) dhe ka sjellë vetë modelin multi-company në 008_companies.sql.
+-- Prandaj:
+--   * numri i ri është 009 (zbatohet pas 008);
+--   * HIQEN krijimet e tabelave companies dhe company_users — main i krijon në 008 si
+--     companies / user_companies (me code, nipt, country, vat_rate);
+--   * HIQEN ALTER sessions.company_id dhe user_sessions_active — nuk përdoren nga
+--     kodi i bashkuar (gjurmimi i sesionit aktiv nuk ekziston as në main, as në degë);
+--   * users.is_superadmin MBETET: e përdor auth.js i bashkuar (një user jo
+--     ROLE-ADMIN mund të shpallet superadmin) dhe ensureAdmin e vendos TRUE;
+--   * company_wipe_epoch MBETET: shënon pastrimin e të dhënave relacionale të një
+--     kompanie (/api/admin/company/:id/wipe) dhe është i ndarë nga shenjat e
+--     wipe-it të app_state që companies.js i mban në tabelën meta;
+--   * HIQET ALTER audit_log.company_id — e shton tashmë 008_companies.sql;
+--   * SHTOHEN vetëm kolonat që modeli i degës kishte dhe 008 nuk i ka:
+--     companies.phone, companies.email, companies.settings, companies.updated_at
+--     (tax_id e degës përputhet me companies.nipt të main-it).
+-- Gjithçka tjetër (tabelat e biznesit + company_sync) vjen e pandryshuar nga dega.
 
--- Kompanitë
-CREATE TABLE IF NOT EXISTS companies (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  tax_id TEXT NOT NULL DEFAULT '',
-  address TEXT NOT NULL DEFAULT '',
-  city TEXT NOT NULL DEFAULT '',
-  phone TEXT NOT NULL DEFAULT '',
-  email TEXT NOT NULL DEFAULT '',
-  currency TEXT NOT NULL DEFAULT 'ALL',
-  active BOOLEAN NOT NULL DEFAULT TRUE,
-  settings JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Lidhja user <-> kompani (një user mund t'i përkasë shumë kompanive; një kompani shumë userave)
-CREATE TABLE IF NOT EXISTS company_users (
-  company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role_in_company TEXT NOT NULL DEFAULT 'user', -- 'owner' | 'admin' | 'manager' | 'user'
-  is_default BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (company_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS company_users_user_idx ON company_users(user_id);
-
--- Shtojmë company_id në përdorues (për superadmin global, user pa kompani; user-at me role 'ROLE-ADMIN'
--- pa kompani janë superadmina që menaxhojnë platformën).
+-- Flamuri i superadmin-it (auth.js: is_superuser = role ROLE-ADMIN ose kjo kolonë).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_superadmin BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Kolona shtesë në companies, të trashëguara nga modeli i degës.
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT '';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT '';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 -- Tabelat e biznesit (me company_id për izolim).
 -- Çdo tabelë ka PK `(company_id, id)` për indeksim e izolim perfekt.
@@ -227,29 +221,16 @@ CREATE TABLE IF NOT EXISTS purchase_invoices (
 );
 CREATE INDEX IF NOT EXISTS purchase_invoices_number_idx ON purchase_invoices(company_id, number);
 
--- Shtojmë kolona `company_id` në tabelat ekzistuese (audit, sessions) për filtrim,
--- por vlerat e vjetra mbeten NULL (përputhshmëri).
-ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS company_id TEXT;
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS company_id TEXT;
-
--- Tabela për session-aktive (e dimë në cilën kompani është aktualisht useri).
-CREATE TABLE IF NOT EXISTS user_sessions_active (
-  token_hash TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  company_id TEXT REFERENCES companies(id) ON DELETE SET NULL,
-  last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Shenja e wipe-it TANI për çdo kompani (nuk është më globale).
-CREATE TABLE IF NOT EXISTS company_wipe_epoch (
-  company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
-  wiped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  wiped_by TEXT NOT NULL DEFAULT ''
-);
-
 -- Regjistër për sinkronizim realtime (version monotonik për kompani).
 CREATE TABLE IF NOT EXISTS company_sync (
   company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
   version BIGINT NOT NULL DEFAULT 1,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Shenja e wipe-it relacional për çdo kompani (pastrimi i tabelave të biznesit).
+CREATE TABLE IF NOT EXISTS company_wipe_epoch (
+  company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+  wiped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  wiped_by TEXT NOT NULL DEFAULT ''
 );

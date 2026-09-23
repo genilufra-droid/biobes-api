@@ -114,6 +114,34 @@ Zbatuar në `migrations/006_odoo_access.sql` + `access.js`, me të njëjtat konc
 forma nuk është objekt i vlefshëm, mungojnë fushat e njohura (min 3),
 ka ID duplikate, **lot/peshim me neto negative** ose pagesë me shumë ≤ 0.
 
+## Multi-company (kompanitë) — migrimi `008`
+
+Çdo kompani ka **gjendjen e vet** në `app_state` (rreshti `id` = ID e kompanisë: `C1`, `C2`, …)
+me versionin, epokën e wipe-it, backup-et dhe zërat e auditimit të vet.
+- **Pa parametër** `company`, kërkesat bien në kompaninë e parazgjedhur të përdoruesit
+  (ose `DEFAULT_COMPANY`, parazgjedhur `C1`) → klienti i vjetër punon pa asnjë ndryshim.
+- **Anëtarësia kontrollohet në server**: kush nuk është në `user_companies` merr **403**
+  (state, version, edhe sikur kompaninë ta ndryshojë nga shfletuesi). Administratori sheh gjithçka.
+- Kompania e re nis bosh (pa gjendje në server); numërimi i dokumentave bëhet në aplikacion.
+- Migrimi i skemës: gjendja ekzistuese, backup-et, auditimi, epoka e wipe-it dhe grupet e
+  përdoruesve kalojnë te **C1** pa humbur asgjë; krijohet edhe kopja `app_state_bak_008`.
+
+Rrugët e reja (vetëm ADMIN):
+```
+GET    /api/admin/companies                → lista + përdoruesit/versioni per kompani
+POST   /api/admin/companies                → {code,name,nipt,address,city,country,vatRate,currency}
+PATCH  /api/admin/companies/:id            → përditësim fushe (active:false = çaktivizim)
+GET    /api/admin/users/:id/companies      → anëtarësia e përdoruesit
+PUT    /api/admin/users/:id/companies      → {companies:[{id,isDefault}]}
+```
+Rrugët ekzistuese që tani pranojnë `?company=` / `company` në trup:
+`GET/PUT /api/state`, `GET /api/state/version`, `GET /api/audit`,
+`GET/POST /api/backups`, `POST /api/backups/:id/restore`, `POST /api/admin/wipe`.
+Rikthimi i një backup-i në një kompani **tjetër** refuzohet (400) — pastërti kontabël.
+
+Provat lokale: `npm run test:multicompany` (48 kontrolle, server real + Postgres real) dhe
+`npm run test:migration008` (9 kontrolle mbi bazë ekzistuese).
+
 ## Konkurrenca (dy përdorues njëkohësisht)
 
 Gjendja ka **version**. `PUT` me `baseVersion` të vjetër kthen **409** — shkrimi
@@ -122,7 +150,9 @@ i dytë nuk e mbishkruan të parin. Aplikacioni hap dritaren e konfliktit:
 
 ## Epoka e fshirjes (Reset me 0 gjurmë kudo)
 
-`POST /api/admin/wipe` (tabela `meta`, migrimi `003`) lë shenjën `wiped_at`.
+`POST /api/admin/wipe` (tabela `meta`, migrimi `003`) lë shenjën `wiped_at:<kompania>`
+(nga migrimi `008`; pa `company` prek kompaninë e parazgjedhur) — vetëm gjendja e asaj
+kompanie fshihet, të tjerat nuk preken.
 `GET /api/state` e kthen (`wipedAt`); `PUT` pa `wipeAck` të saktë kthehet **409 `{wiped:true}`**
 — pajisjet e vjetra nuk ringjallin dot të dhëna të fshira. `PUT`-i i parë i miratuar
 (me `wipeAck`) e pastron shenjën dhe nis epokën e re. Përdoruesit + 1 rresht auditi `WIPE` mbijetojnë.
@@ -189,3 +219,16 @@ curl localhost:3000/api/health
 - `CORS_ORIGIN` = domain-i ekzakt i aplikacionit (nga `*`).
 - Domain personal: Render → Custom Domain te të dy serviset.
 - Plan me pagesë për API-n nëse "gjumi" i planit falas pengon.
+
+## Ngjarje në kohë reale (SSE) — /api/events
+
+- `GET /api/events?token=…` hap një lidhje të vazhdueshme (Server-Sent Events). Token-i
+  pranohet edhe si parametër sepse `EventSource` nuk lejon header-a; pa token → 401.
+- Ngjarjet: `hello` (kur hapet), `state-changed {company,version,actor,wiped?}`,
+  `companies-changed`, `rights-changed`. Lidhja mbahet gjallë me `: ping` çdo 25 s dhe
+  klienti rikontektohet vetë (`retry: 2000`).
+- Shpërndarja respekton anëtarësinë: superuser-i merr të gjitha kompanitë, përdoruesit e
+  tjerë vetëm kompanitë e tyre (prova: `test-events-local.cjs`).
+- Përgjigjet JSON > 1 KB kompresohen me gzip (gjendja ~2.7 MB → ~90% më e vogël).
+- Provat: `node test-events-local.cjs` (20 kontrolle) dhe `node test-realtime-load-local.cjs`
+  (20 përdorues njëkohësisht: 20 lidhje SSE, 10 shkrues paralelë, 0 humbje — 14 kontrolle).

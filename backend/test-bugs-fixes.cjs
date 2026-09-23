@@ -32,6 +32,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+
+  // Pastrim i garantuar: nëse testi dështon në mes, procesi i serverit dhe
+  // PGlite-i mbeteshin gjallë dhe zinin portat (3202/3203, 5434/5435).
+  const cleanup = () => { try { child.kill('SIGKILL'); } catch (_) {} try { srv.stop().catch(() => {}); } catch (_) {} };
+  process.on('exit', cleanup);
   let serverLog = '';
   child.stdout.on('data', (d) => { serverLog += d; });
   child.stderr.on('data', (d) => { serverLog += d; });
@@ -42,7 +47,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   };
   const login = async (u, pw) => call('/api/auth/login', { method: 'POST', body: JSON.stringify({ username: u, password: pw }) });
 
-  for (let i = 0; i < 60; i++) { try { if ((await call('/api/health')).ok) break; } catch (_) {} await sleep(200); }
+  for (let i = 0; i < 200; i++) { try { if ((await call('/api/health')).ok) break; } catch (_) {} await sleep(200); }
 
   const A = await login(ADMIN, PASS);
   if (!A.ok) { console.log(serverLog); process.exit(1); }
@@ -92,7 +97,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     u.searchParams.set('token', B.data.token);
     // Node 22 fetch i mbështet HTTP streaming por leximi është async; lexojmë manualisht.
     fetch(u.toString()).then((resp) => {
-      ok('sse-connected', resp.status === 200 && resp.headers.get('content-type') === 'text/event-stream', 'status=' + resp.status);
+      ok('sse-connected', resp.status === 200 && String(resp.headers.get('content-type') || '').startsWith('text/event-stream'), 'status=' + resp.status + ' ct=' + resp.headers.get('content-type'));
       sseOpened = true;
       const reader = resp.body.getReader();
       const dec = new TextDecoder();
@@ -161,7 +166,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       setTimeout(() => resolve(), 5000);
     }).catch(() => resolve());
   });
-  ok('sse-wipe-received', wipeEvents.some(e => e.event === 'wipe'), 'wipeEvents=' + wipeEvents.map(e=>e.event).join(','));
+  // main e dërgon pastrimin si event 'state-changed' me fushën wiped:true.
+  ok('sse-wipe-received', wipeEvents.some(e => e.event === 'wipe' || (e.event === 'state-changed' && e.data && e.data.wiped === true)), 'wipeEvents=' + wipeEvents.map(e=>e.event).join(','));
 
   console.log('\n' + pass + ' PASS, ' + fail + ' FAIL');
   child.kill('SIGTERM');
