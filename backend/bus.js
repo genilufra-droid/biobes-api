@@ -50,11 +50,13 @@ async function start(connectionString, ssl, injectedClient) {
     if (!msg || !msg.payload) return;
     try {
       const data = JSON.parse(msg.payload);
+      counters.received++;
       // Postgres-i ua dërgon NOTIFY-n edhe vetë dërguesit: pa këtë filtër çdo
       // ngjarje do të shpërndahej dy herë te pajisjet e instancës që e prodhoi.
-      if (data && data.from && data.from === MY_ID) return;
+      if (data && data.from && data.from === MY_ID) { counters.ownFiltered++; return; }
+      log.debug('bus: njoftim i marrë', { event: data && data.event, from: data && data.from });
       for (const h of handlers) { try { h(data); } catch (e) { log.error('bus: handler', { err: e.message }); } }
-    } catch (e) { log.warn('bus: payload i pavlefshëm', { err: e.message }); }
+    } catch (e) { counters.errors++; counters.lastError = e.message; log.warn('bus: payload i pavlefshëm', { err: e.message }); }
   });
   try {
     await client.connect();
@@ -77,8 +79,12 @@ async function publish(event, payload, opts = {}) {
   try {
     const body = JSON.stringify({ event, payload, opts, from: MY_ID });
     await client.query('SELECT pg_notify($1, $2)', [CHANNEL, body]);
+    counters.published++;
+    log.debug('bus: ngjarje u publikua', { event, bytes: body.length });
     return 1;
   } catch (e) {
+    counters.errors++;
+    counters.lastError = e.message;
     log.error('bus: dërgimi dështoi', { err: e.message });
     return 0;
   }
