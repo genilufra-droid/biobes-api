@@ -456,7 +456,7 @@ function findNewNumberDuplicate(prevNums, next) {
   return null;
 }
 
-app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (req, res) => {
+const handleStatePatch = async (req, res) => {
   try {
     const COMPANY = req.company;
     const ops = (req.body && req.body.ops) || null;
@@ -530,7 +530,10 @@ app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), async (r
       try { client.release(); } catch (e) {}
     }
   } catch (e) { console.error('[state:patch]', e.message); res.status(500).json({ ok: false, error: 'Gabim serveri' }); }
-});
+};
+
+app.post('/api/state/patch', needDb, needAuth, companies.needCompany(), handleStatePatch);
+app.patch('/api/state', needDb, needAuth, companies.needCompany(), handleStatePatch);
 
 app.get('/api/audit', needDb, needAuth, needAccess('audit', 'read'), async (req, res) => {
   try {
