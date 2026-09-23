@@ -52,8 +52,9 @@ function broadcast(event, payload, opts = {}) {
 // Ngjarje të ardhura nga një instancë tjetër: shpërndahen vetëm lokalisht,
 // përndryshe do të krijohej një cikël i pafund mes instancave.
 bus.onMessage(({ event, payload, opts }) => {
-  if (!event) return;
-  broadcastLocal(event, payload, opts || {});
+  if (!event) { log.warn('bus: njoftim pa emër ngjarjeje'); return; }
+  const n = broadcastLocal(event, payload, opts || {});
+  log.info('bus: ngjarje nga instancë tjetër u shpërndarë lokalisht', { event, clients: clients.size, delivered: n });
 });
 
 const stateChanged = (company, version, actor, extra = {}) =>

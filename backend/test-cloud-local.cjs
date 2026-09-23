@@ -298,6 +298,14 @@ function sse(url) {
       const put = await A.call('/api/state', { method: 'PUT', headers: HA, body: JSON.stringify({ state: st }) });
       await sleep(2500);
       const got = client.events.some((e) => e.event === 'state-changed');
+      if (!got) {
+        // Diagnostikim: pa logjet e dy servereve, "ngjarja nuk mbërriti" është
+        // e pamundur të kuptohet — a u publikua, a u morë, a u shpërnda?
+        console.log('   --- logjet e A (fundi) ---');
+        A.logs().split('\n').filter((l) => l.trim()).slice(-6).forEach((l) => console.log('   ' + l.slice(0, 190)));
+        console.log('   --- logjet e B (fundi) ---');
+        B.logs().split('\n').filter((l) => l.trim()).slice(-8).forEach((l) => console.log('   ' + l.slice(0, 190)));
+      }
       const hA = await A.call('/api/health');
       const hB = await B.call('/api/health');
       ok('dy instanca: ndryshimi në A arrin te pajisja lidhur në B', got,
